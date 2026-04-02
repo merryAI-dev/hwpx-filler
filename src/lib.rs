@@ -17,6 +17,7 @@ pub mod error;
 pub mod model;
 pub mod parser;
 pub mod filler;
+pub mod extractor;
 pub mod zipper;
 pub mod patcher;
 pub mod stream_analyzer;
