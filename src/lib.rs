@@ -19,4 +19,5 @@ pub mod parser;
 pub mod filler;
 pub mod analyzer;
 pub mod zipper;
+pub mod patcher;
 pub mod validate;

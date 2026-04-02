@@ -75,8 +75,6 @@ pub fn analyze_table(table: &Table, table_index: usize) -> FormAnalysis {
     for row in &table.rows {
         for (i, cell) in row.cells.iter().enumerate() {
             let text = cell.text();
-            let bf = cell.border_fill_id_ref.clone().unwrap_or_default();
-
             let cell_type = classify_cell(cell, &text, &label_fills, table);
 
             if cell_type == CellType::Label {
@@ -130,7 +128,7 @@ fn classify_cell(
     }
 
     // header 속성이 true면 label
-    if cell.header {
+    if cell.header != 0 {
         return CellType::Label;
     }
 

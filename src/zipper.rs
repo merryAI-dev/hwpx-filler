@@ -116,16 +116,21 @@ mod tests {
         // 검증: PNG가 byte-perfect인지
         let reader = Cursor::new(&patched);
         let mut archive = ZipArchive::new(reader).unwrap();
-
-        let mut png_entry = archive.by_name("Preview/PrvImage.png").unwrap();
-        let mut png_bytes = Vec::new();
-        png_entry.read_to_end(&mut png_bytes).unwrap();
+        let png_bytes = {
+            let mut entry = archive.by_name("Preview/PrvImage.png").unwrap();
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).unwrap();
+            buf
+        };
         assert_eq!(png_bytes, vec![0x89, 0x50, 0x4E, 0x47, 0xFF, 0x00, 0xAB]);
 
         // 검증: XML이 교체됐는지
-        let mut xml_entry = archive.by_name("Contents/section0.xml").unwrap();
-        let mut xml_content = String::new();
-        xml_entry.read_to_string(&mut xml_content).unwrap();
+        let xml_content = {
+            let mut entry = archive.by_name("Contents/section0.xml").unwrap();
+            let mut s = String::new();
+            entry.read_to_string(&mut s).unwrap();
+            s
+        };
         assert!(xml_content.contains("replaced"));
     }
 }

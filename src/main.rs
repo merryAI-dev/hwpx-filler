@@ -1,6 +1,9 @@
-//! hwpx-fill CLI — 서식5 테스트
+//! hwpx-fill CLI
 //!
-//! Usage: hwpx-fill <template.hwpx> <output.hwpx>
+//! 전략: 파싱은 serde(타입 안전), 출력은 원본 XML 스트리밍 패치(무손실)
+//! - serde 파싱 → 테이블 구조 분석 + 필드 감지
+//! - quick-xml Reader/Writer → 원본 XML 스트리밍하면서 <hp:t>만 교체
+//! - 원본 ZIP 패치 → 바이너리 byte-perfect
 
 use std::env;
 use std::fs;
@@ -27,12 +30,12 @@ fn main() {
         .expect("ZIP 추출 실패");
     println!("   {} text files extracted", text_files.len());
 
-    // 3. Parse section0.xml
+    // 3. Parse section0.xml (serde — for structure analysis)
     let section0_xml = text_files.get("Contents/section0.xml")
         .expect("section0.xml not found");
     println!("3. Parsing section0.xml ({} bytes)...", section0_xml.len());
 
-    let mut section = hwpx_filler::parser::parse_section(section0_xml)
+    let section = hwpx_filler::parser::parse_section(section0_xml)
         .expect("XML 파싱 실패");
 
     // 4. Analyze tables
@@ -49,43 +52,45 @@ fn main() {
         }
     }
 
-    // 5. Fill with test data
-    println!("\n5. Filling test data...");
-    let fields = vec![
-        hwpx_filler::filler::FillField { table_index: 1, row: 0, col: 1, value: "김보람".into() },
-        hwpx_filler::filler::FillField { table_index: 1, row: 0, col: 4, value: "AXR팀장".into() },
-        hwpx_filler::filler::FillField { table_index: 1, row: 0, col: 6, value: "1995.01.15".into() },
-        hwpx_filler::filler::FillField { table_index: 1, row: 1, col: 1, value: "boram@mysc.co.kr".into() },
-        hwpx_filler::filler::FillField { table_index: 1, row: 1, col: 4, value: "010-1234-5678".into() },
+    // 5. Patch original XML with test data (streaming — preserves everything)
+    println!("\n5. Patching cells (streaming XML)...");
+    let patches: Vec<(usize, u32, u32, String)> = vec![
+        (1, 0, 1, "김보람".into()),
+        (1, 0, 4, "AXR팀장".into()),
+        (1, 0, 6, "1995.01.15".into()),
+        (1, 1, 1, "boram@mysc.co.kr".into()),
+        (1, 1, 4, "010-1234-5678".into()),
+        (1, 2, 1, "          5년       3개월".into()),
+        (1, 2, 4, "정보처리기사".into()),
+        (1, 3, 1, "AI 자동화".into()),
+        (1, 3, 3, "26. 01～26. 12".into()),
+        (1, 3, 6, "     50 %".into()),
     ];
 
-    let warnings = hwpx_filler::filler::fill_fields(&mut section, &fields)
-        .expect("채움 실패");
-    for w in &warnings {
-        println!("   WARNING: {}", w);
-    }
-    if warnings.is_empty() {
-        println!("   {} fields filled successfully", fields.len());
-    }
+    let patched_xml = hwpx_filler::patcher::patch_cells(section0_xml, &patches)
+        .expect("패치 실패");
+    println!("   {} cells patched", patches.len());
 
-    // 6. Validate
-    println!("\n6. Validating...");
-    let validation = hwpx_filler::validate::validate_section(&section);
-    if validation.valid {
-        println!("   ✓ Structure valid");
-    } else {
-        for err in &validation.errors {
-            println!("   ✗ {}", err);
+    // 6. Validate patched XML (re-parse to verify)
+    println!("\n6. Validating (re-parse test)...");
+    match hwpx_filler::parser::parse_section(&patched_xml) {
+        Ok(patched_section) => {
+            let validation = hwpx_filler::validate::validate_section(&patched_section);
+            if validation.valid {
+                println!("   ✓ Re-parse + validation passed");
+            } else {
+                for err in &validation.errors {
+                    println!("   ✗ {}", err);
+                }
+            }
         }
+        Err(e) => println!("   ✗ Re-parse failed: {}", e),
     }
 
-    // 7. Serialize + patch ZIP
+    // 7. Patch ZIP and save
     println!("\n7. Repacking HWPX (binary-safe)...");
-    let new_xml = hwpx_filler::parser::serialize_section(&section)
-        .expect("직렬화 실패");
-
     let mut modified = std::collections::HashMap::new();
-    modified.insert("Contents/section0.xml".to_string(), new_xml);
+    modified.insert("Contents/section0.xml".to_string(), patched_xml);
 
     let output = hwpx_filler::zipper::patch_hwpx(&hwpx_bytes, &modified)
         .expect("ZIP 패치 실패");

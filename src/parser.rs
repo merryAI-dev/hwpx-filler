@@ -4,7 +4,7 @@
 //! 알 수 없는 필드는 `#[serde(flatten)]`으로 보존해서
 //! 재직렬화 시 데이터 손실 없음.
 
-use crate::error::{FillerError, Result};
+use crate::error::Result;
 use crate::model::Section;
 
 /// section0.xml 문자열을 Section 구조체로 파싱
@@ -28,13 +28,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_simple() {
+    fn parse_simple_section() {
         let xml = r#"<sec><p id="0" paraPrIDRef="1"><run charPrIDRef="2"><t>hello</t></run></p></sec>"#;
         let section = parse_section(xml).unwrap();
         assert_eq!(section.paragraphs.len(), 1);
-        assert_eq!(section.paragraphs[0].runs[0].texts, vec!["hello".to_string()]);
+        assert_eq!(section.paragraphs[0].runs.len(), 1);
+        let text = match &section.paragraphs[0].runs[0].contents[0] {
+            crate::model::RunContent::Text(s) => s.clone(),
+            _ => panic!("expected Text"),
+        };
+        assert_eq!(text, "hello");
+    }
 
-        let out = serialize_section(&section).unwrap();
-        assert!(out.contains("hello"));
+    #[test]
+    fn parse_run_with_mixed_content() {
+        // Run에 secPr + t가 섞인 경우 — openhwp의 $value 패턴
+        let xml = r#"<sec><p id="0"><run charPrIDRef="1"><secPr id=""/><t>text</t></run></p></sec>"#;
+        let section = parse_section(xml).unwrap();
+        let run = &section.paragraphs[0].runs[0];
+        assert_eq!(run.contents.len(), 2);
+        assert!(matches!(&run.contents[0], crate::model::RunContent::Other { tag, .. } if tag == "secPr"));
+        assert!(matches!(&run.contents[1], crate::model::RunContent::Text(s) if s == "text"));
     }
 }
