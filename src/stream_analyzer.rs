@@ -231,15 +231,18 @@ pub fn analyze_xml(xml: &str) -> Vec<TableInfo> {
 }
 
 /// 테이블에서 label→data 필드 매핑 추출
+///
+/// 두 가지 패턴을 감지:
+/// 1. 가로 패턴: [Label] [Data] — 같은 행에서 라벨 옆에 데이터
+/// 2. 세로 패턴: 헤더 행(전부 label/text) 아래에 데이터 행(전부 empty) — 컬럼별 필드
 pub fn extract_fields(tables: &[TableInfo]) -> Vec<FieldInfo> {
     let mut fields = Vec::new();
 
     for table in tables {
+        // Pass 1: 가로 패턴 (기존)
         for row in &table.rows {
             for (i, cell) in row.cells.iter().enumerate() {
                 if !cell.is_label { continue; }
-
-                // 오른쪽에 data 셀이 있는지
                 if let Some(data_cell) = row.cells.get(i + 1) {
                     if !data_cell.is_label {
                         let key = infer_canonical_key(&cell.text);
@@ -250,7 +253,67 @@ pub fn extract_fields(tables: &[TableInfo]) -> Vec<FieldInfo> {
                             label: cell.text.clone(),
                             canonical_key: key.to_string(),
                             confidence: if key != "unknown" { 0.95 } else { 0.5 },
-                            content_type: ContentType::Unknown, // serde enrichment에서 갱신
+                            content_type: ContentType::Unknown,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Pass 2: 세로 패턴 — 헤더 행 감지 + 아래 데이터 행들
+        // 헤더 행 조건: 모든 셀이 텍스트 있음 + 바로 아래 행의 셀이 대부분 비어있음
+        for (row_idx, row) in table.rows.iter().enumerate() {
+            if row.cells.is_empty() { continue; }
+            if row.cells.len() < 2 { continue; } // 최소 2열 이상
+
+            // 이 행의 셀이 전부 텍스트가 있는가?
+            let all_have_text = row.cells.iter().all(|c| !c.text.trim().is_empty());
+            if !all_have_text { continue; }
+
+            // 바로 아래 행이 있고, 대부분 비어있는가?
+            let next_row = table.rows.get(row_idx + 1);
+            let is_header_row = if let Some(next) = next_row {
+                let empty_count = next.cells.iter().filter(|c| c.text.trim().is_empty()).count();
+                let total = next.cells.len();
+                total > 0 && empty_count as f32 / total as f32 >= 0.7
+            } else {
+                false
+            };
+
+            if !is_header_row { continue; }
+
+            // 이 행 = 세로 테이블 헤더! 아래 데이터 행들에 대해 컬럼별 필드 생성
+            let header_cells: Vec<&CellInfo> = row.cells.iter().collect();
+
+            // 가로 패턴에서 이미 잡힌 필드의 위치를 제외
+            let already_mapped: std::collections::HashSet<(u32, u32)> = fields.iter()
+                .map(|f| (f.row, f.col))
+                .collect();
+
+            for data_row in table.rows.iter().skip(row_idx + 1) {
+                // 데이터 행이 아닌 다른 헤더 행이 나오면 중단
+                let has_data = data_row.cells.iter().any(|c| !c.text.trim().is_empty());
+                let mostly_labels = data_row.cells.iter()
+                    .filter(|c| !c.text.trim().is_empty())
+                    .all(|c| c.is_label);
+                if has_data && mostly_labels { break; } // 다음 섹션 헤더
+
+                for data_cell in &data_row.cells {
+                    if already_mapped.contains(&(data_cell.row, data_cell.col)) { continue; }
+
+                    // 같은 col을 가진 헤더 셀 찾기
+                    if let Some(header_cell) = header_cells.iter()
+                        .find(|h| h.col == data_cell.col)
+                    {
+                        let key = infer_canonical_key(&header_cell.text);
+                        fields.push(FieldInfo {
+                            table_index: table.index,
+                            row: data_cell.row,
+                            col: data_cell.col,
+                            label: header_cell.text.clone(),
+                            canonical_key: key.to_string(),
+                            confidence: if key != "unknown" { 0.8 } else { 0.4 },
+                            content_type: ContentType::Unknown,
                         });
                     }
                 }
