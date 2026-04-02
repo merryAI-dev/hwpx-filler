@@ -37,8 +37,10 @@ jobs:
       - name: Assemble dist
         run: |
           mkdir -p dist
-          cp wizard.html dist/index.html
-          cp -r pkg dist/pkg
+          PKG_DIR="pkg-${GITHUB_SHA::8}"
+          mkdir -p "dist/${PKG_DIR}"
+          cp -r pkg/. "dist/${PKG_DIR}/"
+          sed "s#\./pkg/hwpx_filler\.js#./${PKG_DIR}/hwpx_filler.js#g" wizard.html > dist/index.html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
