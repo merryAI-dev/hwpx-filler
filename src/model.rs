@@ -129,34 +129,7 @@ impl Serialize for RunContent {
 
 impl<'de> Deserialize<'de> for RunContent {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        // quick-xml의 enum은 태그명으로 variant를 선택
-        // 알려진 것: t, tbl. 나머지는 Other로.
-
-        // 내부 enum으로 시도하고, 실패하면 Other
-        #[derive(Deserialize)]
-        enum Known {
-            #[serde(rename = "t")]
-            Text(String),
-            #[serde(rename = "tbl")]
-            Table(Box<Table>),
-        }
-
-        // serde는 한 번만 시도 가능하므로, untagged 사용
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Either {
-            Known(Known),
-            #[serde(deserialize_with = "deserialize_other")]
-            Other(()),
-        }
-
-        fn deserialize_other<'de, D: serde::Deserializer<'de>>(_d: D) -> std::result::Result<(), D::Error> {
-            // 아무 값이나 받아서 무시
-            let _ = serde::de::IgnoredAny::deserialize(_d)?;
-            Ok(())
-        }
-
-        // 알려진 태그를 variant로 정의. Text/Table만 구조화, 나머지는 Value로 보존.
+        // Text/Table만 구조화, 나머지 20+ HWPX 요소는 serde_json::Value로 보존.
         #[derive(Deserialize)]
         enum Full {
             #[serde(rename = "t")]
