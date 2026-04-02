@@ -31,7 +31,7 @@ use std::cell::RefCell;
 // 탭 닫기/새로고침 시 WASM 인스턴스와 함께 소멸 (localStorage 미사용).
 #[cfg(feature = "wasm")]
 thread_local! {
-    static API_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+    static API_KEY: RefCell<Option<String>> = RefCell::new(None);
 }
 
 /// API 키 설정 — WASM 메모리에만 저장, JS/localStorage로 반출 불가
