@@ -77,6 +77,21 @@
     .status-success { background: #dcfce7; color: #166534; }
     .status-error { background: #fee2e2; color: #991b1b; }
 
+    .learning-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 14px; margin-bottom: 20px; }
+    .learning-toolbar .meta { font-size: 12px; color: #64748b; margin-right: auto; }
+    .learning-panel { margin-top: 16px; padding: 16px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
+    .learning-panel h3 { font-size: 14px; margin-bottom: 8px; }
+    .learning-panel p { font-size: 12px; color: #64748b; margin-bottom: 10px; }
+    .structure-card { border: 1px solid #e2e8f0; border-radius: 8px; background: #fff; padding: 12px; margin-top: 10px; }
+    .structure-grid { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+    .structure-grid td, .structure-grid th { border: 1px solid #e2e8f0; padding: 6px; vertical-align: top; }
+    .structure-cell { min-width: 120px; }
+    .structure-cell-text { font-size: 11px; color: #1e293b; margin-bottom: 6px; white-space: pre-wrap; word-break: break-word; }
+    .structure-cell-meta { font-size: 10px; color: #94a3b8; margin-bottom: 4px; }
+    .structure-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+    .structure-low { color: #b45309; }
+    .structure-good { color: #166534; }
+
     /* LLM */
     .llm-section { margin-top: 16px; padding: 16px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
     .llm-section h3 { font-size: 14px; margin-bottom: 8px; }
@@ -95,6 +110,16 @@
   <div class="container">
     <h1>HWPX 양식 자동 채움</h1>
     <p class="subtitle">기본 처리와 규칙 기반 매핑은 브라우저에서 실행됩니다. AI 기능을 누를 때만 필요한 라벨 또는 일부 값이 Anthropic으로 전송됩니다.</p>
+    <div class="learning-toolbar">
+      <div class="meta" id="learning-meta">표 인식 학습 데이터 로딩 중...</div>
+      <button class="btn btn-outline" onclick="exportLearningData()" style="padding:6px 14px;font-size:13px">학습 내보내기</button>
+      <label class="btn btn-outline" style="padding:6px 14px;font-size:13px;display:inline-flex;align-items:center;cursor:pointer">
+        학습 가져오기
+        <input type="file" accept=".json" style="display:none" onchange="importLearningData(this)">
+      </label>
+      <button class="btn btn-outline" onclick="clearLearningData()" style="padding:6px 14px;font-size:13px">학습 초기화</button>
+    </div>
+    <div id="learning-status"></div>
 
     <!-- Progress Bar -->
     <div class="progress">
@@ -135,6 +160,7 @@
         <button class="btn btn-primary" onclick="handleSourceJson()" style="margin-top:8px">JSON 확인</button>
       </div>
       <div id="source-preview"></div>
+      <div id="source-structure"></div>
       <div class="btn-row">
         <button class="btn btn-primary" id="btn-step1-next" disabled onclick="goStep(2)">다음</button>
       </div>
@@ -150,6 +176,7 @@
         <input type="file" accept=".hwpx" onchange="handleTemplate(this)">
       </label>
       <div id="template-preview"></div>
+      <div id="template-structure"></div>
       <div class="btn-row">
         <button class="btn btn-secondary" onclick="goStep(1)">이전</button>
         <button class="btn btn-primary" id="btn-step2-next" disabled onclick="goStep(3)">다음</button>
@@ -204,10 +231,11 @@
 
   <script type="module">
     import init, {
-      analyzeForm, fillForm, extractData, extractCsv, mapToForm, formatForLLM,
+      analyzeForm, analyzeFormAdaptive, inspectTables, fillForm,
+      extractData, extractDataAdaptive, extractCsv, mapToForm, formatForLLM,
       // Privacy-preserving exports (2세대)
       setApiKey, clearApiKey, hasApiKey, callAnthropic,
-      extractLabelsOnly, applyLabelMappings,
+      extractLabelsOnly, applyLabelMappings, updateRecognitionPolicy,
     } from './pkg/hwpx_filler.js';
 
     // ── State ──
@@ -220,10 +248,17 @@
       editedMappings: null, // MappingInfo[] — UI 표시용
       llmLabelPairs: null,  // [{sourceLabel, targetLabel}] — applyLabelMappings용
       useLlmPath: false,    // true면 applyLabelMappings, false면 fillForm
+      recognitionPolicy: null,
+      sourceInspection: null,
+      templateInspection: null,
+      structureEdits: { source: {}, template: {} },
+      structureSelection: { source: null, template: null },
     };
 
     // ── Init WASM ──
     await init();
+    S.recognitionPolicy = await loadRecognitionPolicy();
+    renderLearningMeta();
 
     // ── Expose to onclick ──
     window.switchTab = (tab) => {
@@ -234,16 +269,402 @@
       });
     };
 
+    const LEARNING_DB = 'hwpx-filler-learning';
+    const LEARNING_VERSION = 1;
+    const POLICY_KEY = 'default';
+
+    async function openLearningDb() {
+      if (!('indexedDB' in window)) return null;
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(LEARNING_DB, LEARNING_VERSION);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains('policies')) db.createObjectStore('policies', { keyPath: 'id' });
+          if (!db.objectStoreNames.contains('feedbackEvents')) db.createObjectStore('feedbackEvents', { keyPath: 'id', autoIncrement: true });
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function dbGet(storeName, key) {
+      const db = await openLearningDb();
+      if (!db) return null;
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readonly');
+        const req = tx.objectStore(storeName).get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function dbPut(storeName, value) {
+      const db = await openLearningDb();
+      if (!db) return;
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        tx.objectStore(storeName).put(value);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    async function dbGetAll(storeName) {
+      const db = await openLearningDb();
+      if (!db) return [];
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readonly');
+        const req = tx.objectStore(storeName).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function dbClear(storeName) {
+      const db = await openLearningDb();
+      if (!db) return;
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        tx.objectStore(storeName).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    async function loadRecognitionPolicy() {
+      try {
+        const stored = await dbGet('policies', POLICY_KEY);
+        return stored?.value || {};
+      } catch (e) {
+        showStatus('learning-status', 'error', `학습 정책 로드 실패: ${e.message}`);
+        return {};
+      }
+    }
+
+    async function saveRecognitionPolicy(policy) {
+      await dbPut('policies', { id: POLICY_KEY, value: policy, updatedAt: new Date().toISOString() });
+    }
+
+    async function appendFeedbackEvents(scope, feedbacks) {
+      const timestamp = new Date().toISOString();
+      for (const feedback of feedbacks) {
+        await dbPut('feedbackEvents', { scope, feedback, createdAt: timestamp });
+      }
+    }
+
+    function renderLearningMeta(extra = '') {
+      const meta = document.getElementById('learning-meta');
+      const feedbackCount = Number(S.recognitionPolicy?.feedbackEvents || 0);
+      meta.textContent = `표 인식 학습 ${feedbackCount}건 저장됨${extra ? ` · ${extra}` : ''}`;
+    }
+
+    window.exportLearningData = async () => {
+      const feedbackEvents = await dbGetAll('feedbackEvents');
+      const payload = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        policy: S.recognitionPolicy || {},
+        feedbackEvents,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `hwpx-learning-${new Date().toISOString().slice(0,10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showStatus('learning-status', 'success', '학습 데이터를 JSON으로 내보냈습니다');
+    };
+
+    window.importLearningData = async (input) => {
+      const file = input.files?.[0];
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        S.recognitionPolicy = parsed.policy || {};
+        await saveRecognitionPolicy(S.recognitionPolicy);
+        await dbClear('feedbackEvents');
+        for (const event of parsed.feedbackEvents || []) {
+          await dbPut('feedbackEvents', event);
+        }
+        renderLearningMeta('가져온 정책 적용');
+        showStatus('learning-status', 'success', '학습 데이터를 가져왔습니다');
+        if (S.sourceBytes) await rerunAdaptiveSource();
+        if (S.templateBytes) await rerunAdaptiveTemplate();
+      } catch (e) {
+        showStatus('learning-status', 'error', `학습 데이터 가져오기 실패: ${e.message}`);
+      } finally {
+        input.value = '';
+      }
+    };
+
+    window.clearLearningData = async () => {
+      S.recognitionPolicy = {};
+      S.structureEdits = { source: {}, template: {} };
+      await saveRecognitionPolicy(S.recognitionPolicy);
+      await dbClear('feedbackEvents');
+      renderLearningMeta('초기화됨');
+      showStatus('learning-status', 'success', '학습 데이터를 초기화했습니다');
+      if (S.sourceBytes) await rerunAdaptiveSource();
+      if (S.templateBytes) await rerunAdaptiveTemplate();
+    };
+
+    function recognitionPolicyJson() {
+      return JSON.stringify(S.recognitionPolicy || {});
+    }
+
+    function getScopeInspection(scope) {
+      return scope === 'source' ? S.sourceInspection : S.templateInspection;
+    }
+
+    function setScopeInspection(scope, inspection) {
+      if (scope === 'source') S.sourceInspection = inspection;
+      else S.templateInspection = inspection;
+    }
+
+    function getSelectedStructureTable(scope, tables) {
+      const selected = S.structureSelection[scope];
+      if (selected != null && tables.some(table => table.tableIndex === selected)) return selected;
+      return tables[0]?.tableIndex ?? null;
+    }
+
+    function ensureStructureEdit(scope, tableIndex) {
+      if (!S.structureEdits[scope][tableIndex]) {
+        S.structureEdits[scope][tableIndex] = { rowKinds: {}, cellRoles: {} };
+      }
+      return S.structureEdits[scope][tableIndex];
+    }
+
+    function predictionForRow(tableTrace, row) {
+      return tableTrace.rows.find(item => Number(item.row) === Number(row))?.selectedKind || 'data';
+    }
+
+    function predictionForCell(tableTrace, row, col) {
+      return tableTrace.cells.find(item => Number(item.row) === Number(row) && Number(item.col) === Number(col))?.selectedRole || 'value';
+    }
+
+    function displayedRowKind(scope, tableTrace, row) {
+      const edit = ensureStructureEdit(scope, tableTrace.tableIndex);
+      return edit.rowKinds[row] || predictionForRow(tableTrace, row);
+    }
+
+    function displayedCellRole(scope, tableTrace, row, col) {
+      const edit = ensureStructureEdit(scope, tableTrace.tableIndex);
+      return edit.cellRoles[`${row}:${col}`] || predictionForCell(tableTrace, row, col);
+    }
+
+    async function rerunAdaptiveSource() {
+      if (!S.sourceBytes) return;
+      const result = extractDataAdaptive(S.sourceBytes, recognitionPolicyJson());
+      const parsed = JSON.parse(result.json);
+      S.sourceData = parsed.fields;
+      S.sourceInspection = { tables: parsed.tables, trace: parsed.trace };
+      S.structureEdits.source = {};
+      renderSourcePreview();
+      renderStructurePanel('source');
+    }
+
+    async function rerunAdaptiveTemplate() {
+      if (!S.templateBytes) return;
+      const result = analyzeFormAdaptive(S.templateBytes, recognitionPolicyJson());
+      const parsed = JSON.parse(result.json);
+      S.formFields = parsed.fields;
+      S.templateInspection = { tables: parsed.tables, trace: parsed.trace };
+      S.structureEdits.template = {};
+      renderTemplatePreview();
+      renderStructurePanel('template');
+    }
+
+    function traceLabel(scope) {
+      return scope === 'source' ? '소스 표' : '대상 양식 표';
+    }
+
+    function renderStructurePanel(scope) {
+      const inspection = getScopeInspection(scope);
+      const container = document.getElementById(scope === 'source' ? 'source-structure' : 'template-structure');
+      if (!inspection?.trace?.length) {
+        container.innerHTML = '';
+        return;
+      }
+
+      const lowConfidenceTables = inspection.trace.filter(table => table.lowConfidence);
+      const targetTables = lowConfidenceTables.length ? lowConfidenceTables : inspection.trace.slice(0, 1);
+      const selectedTableIndex = getSelectedStructureTable(scope, targetTables);
+      S.structureSelection[scope] = selectedTableIndex;
+      const selectedTrace = targetTables.find(table => table.tableIndex === selectedTableIndex);
+      const selectedTable = inspection.tables.find(table => table.index === selectedTableIndex);
+
+      let html = `<div class="learning-panel">`;
+      html += `<h3>${traceLabel(scope)} 구조 학습</h3>`;
+      html += `<p>${lowConfidenceTables.length > 0 ? `${lowConfidenceTables.length}개 표가 저신뢰로 감지되었습니다.` : '현재는 고신뢰 표만 보입니다. 필요하면 표 하나를 열어 구조를 확인할 수 있습니다.'}</p>`;
+      html += `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">`;
+      html += `<select onchange="selectStructureTable('${scope}', this.value)" style="max-width:280px">`;
+      for (const table of targetTables) {
+        const mark = table.lowConfidence ? '저신뢰' : '고신뢰';
+        const selected = Number(selectedTableIndex) === Number(table.tableIndex) ? 'selected' : '';
+        html += `<option value="${table.tableIndex}" ${selected}>Table ${table.tableIndex} · ${mark} · ${Math.round((table.confidence || 0) * 100)}%</option>`;
+      }
+      html += `</select>`;
+      html += `</div>`;
+
+      if (selectedTrace && selectedTable) {
+        html += renderStructureCard(scope, selectedTable, selectedTrace);
+      }
+      html += `</div>`;
+      container.innerHTML = html;
+    }
+
+    function renderStructureCard(scope, table, trace) {
+      let html = `<div class="structure-card">`;
+      html += `<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">`;
+      html += `<strong>Table ${trace.tableIndex}</strong>`;
+      html += `<span class="${trace.lowConfidence ? 'structure-low' : 'structure-good'}">${trace.lowConfidence ? '저신뢰' : '고신뢰'} ${Math.round((trace.confidence || 0) * 100)}%</span>`;
+      html += `<span style="font-size:12px;color:#64748b">kind=${esc(trace.selectedTableKind)}</span>`;
+      html += `<span style="font-size:12px;color:#64748b">fingerprint=${esc(trace.fingerprint.family)}</span>`;
+      html += `</div>`;
+      html += `<table class="structure-grid"><thead><tr><th style="width:72px">헤더</th><th>셀 역할 보정</th></tr></thead><tbody>`;
+      for (const row of table.rows) {
+        const rowAddr = row.cells[0]?.row ?? 0;
+        const checked = displayedRowKind(scope, trace, rowAddr) === 'header' ? 'checked' : '';
+        html += `<tr><td><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" ${checked} onchange="onStructureHeaderToggle('${scope}', ${trace.tableIndex}, ${rowAddr}, this.checked)">행 ${rowAddr}</label></td><td>`;
+        html += `<div style="display:flex;gap:8px;flex-wrap:wrap">`;
+        for (const cell of row.cells) {
+          const value = displayedCellRole(scope, trace, cell.row, cell.col);
+          html += `<div class="structure-cell">`;
+          html += `<div class="structure-cell-meta">r${cell.row} c${cell.col}</div>`;
+          html += `<div class="structure-cell-text">${esc(cell.text || '□')}</div>`;
+          html += `<select onchange="onStructureRoleChange('${scope}', ${trace.tableIndex}, ${cell.row}, ${cell.col}, this.value)">`;
+          for (const option of ['auto', 'label', 'value', 'compound_hint', 'ignore']) {
+            const selected = value === option ? 'selected' : '';
+            html += `<option value="${option}" ${selected}>${esc(option)}</option>`;
+          }
+          html += `</select>`;
+          html += `</div>`;
+        }
+        html += `</div>`;
+        html += `</td></tr>`;
+      }
+      html += `</tbody></table>`;
+      html += `<div class="structure-actions">`;
+      html += `<button class="btn btn-outline" onclick="resetStructureEdits('${scope}', ${trace.tableIndex})">보정 초기화</button>`;
+      html += `<button class="btn btn-primary" onclick="applyStructureLearning('${scope}', ${trace.tableIndex})">이 표 학습 반영</button>`;
+      html += `</div></div>`;
+      return html;
+    }
+
+    window.selectStructureTable = (scope, tableIndex) => {
+      S.structureSelection[scope] = Number(tableIndex);
+      renderStructurePanel(scope);
+    };
+
+    window.onStructureHeaderToggle = (scope, tableIndex, row, checked) => {
+      const edit = ensureStructureEdit(scope, tableIndex);
+      edit.rowKinds[row] = checked ? 'header' : 'data';
+    };
+
+    window.onStructureRoleChange = (scope, tableIndex, row, col, value) => {
+      const edit = ensureStructureEdit(scope, tableIndex);
+      const key = `${row}:${col}`;
+      if (value === 'auto') delete edit.cellRoles[key];
+      else edit.cellRoles[key] = value;
+    };
+
+    window.resetStructureEdits = (scope, tableIndex) => {
+      delete S.structureEdits[scope][tableIndex];
+      renderStructurePanel(scope);
+    };
+
+    async function applyFeedbackAndPersist(scope, feedbacks, successMessage) {
+      const updated = JSON.parse(updateRecognitionPolicy(recognitionPolicyJson(), JSON.stringify(feedbacks)).json);
+      S.recognitionPolicy = updated;
+      await saveRecognitionPolicy(updated);
+      await appendFeedbackEvents(scope, feedbacks);
+      renderLearningMeta(successMessage);
+      if (scope === 'source') await rerunAdaptiveSource();
+      if (scope === 'template') await rerunAdaptiveTemplate();
+    }
+
+    window.applyStructureLearning = async (scope, tableIndex) => {
+      const inspection = getScopeInspection(scope);
+      const tableTrace = inspection?.trace?.find(table => table.tableIndex === tableIndex);
+      const edit = S.structureEdits[scope][tableIndex];
+      if (!tableTrace || !edit) {
+        showStatus('learning-status', 'error', '반영할 구조 보정이 없습니다');
+        return;
+      }
+
+      const rowKinds = Object.entries(edit.rowKinds)
+        .filter(([row, kind]) => kind !== predictionForRow(tableTrace, Number(row)))
+        .map(([row, kind]) => ({
+          row: Number(row),
+          kind,
+          predictedKind: predictionForRow(tableTrace, Number(row)),
+        }));
+
+      const cellRoles = Object.entries(edit.cellRoles)
+        .filter(([key, role]) => {
+          const [row, col] = key.split(':').map(Number);
+          return role !== predictionForCell(tableTrace, row, col);
+        })
+        .map(([key, role]) => {
+          const [row, col] = key.split(':').map(Number);
+          return {
+            row,
+            col,
+            role,
+            predictedRole: predictionForCell(tableTrace, row, col),
+          };
+        });
+
+      if (rowKinds.length === 0 && cellRoles.length === 0) {
+        showStatus('learning-status', 'error', '현재 표에는 학습할 변경점이 없습니다');
+        return;
+      }
+
+      const feedback = {
+        tableIndex,
+        fingerprint: tableTrace.fingerprint,
+        tableKind: tableTrace.selectedTableKind,
+        predictedTableKind: tableTrace.selectedTableKind,
+        rowKinds,
+        cellRoles,
+        reward: 2.0,
+        outcome: 'structure_correction',
+      };
+
+      await applyFeedbackAndPersist(scope, [feedback], `${scope === 'source' ? '소스' : '양식'} 구조 보정 반영`);
+      showStatus('learning-status', 'success', '구조 보정을 학습 데이터에 반영했습니다');
+    };
+
+    async function recordTableOutcome(tableIndexes, outcome) {
+      if (!tableIndexes?.length || !S.templateInspection?.trace?.length) return;
+      const feedbacks = S.templateInspection.trace
+        .filter(table => tableIndexes.includes(table.tableIndex))
+        .map(table => ({
+          tableIndex: table.tableIndex,
+          fingerprint: table.fingerprint,
+          tableKind: table.selectedTableKind,
+          predictedTableKind: table.selectedTableKind,
+          reward: outcome === 'fill_success' ? 1.0 : -2.0,
+          outcome,
+        }));
+      if (feedbacks.length === 0) return;
+      await applyFeedbackAndPersist('template', feedbacks, outcome === 'fill_success' ? '채움 성공 보상 반영' : '채움 실패 패널티 반영');
+    }
+
     window.handleSourceHwpx = async (input) => {
       const file = input.files[0]; if (!file) return;
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
         S.sourceBytes = bytes;
-        // UI + rules fallback용 (값 포함)
-        const result = extractData(bytes);
-        S.sourceData = JSON.parse(result.json);
+        const result = extractDataAdaptive(bytes, recognitionPolicyJson());
+        const parsed = JSON.parse(result.json);
+        S.sourceData = parsed.fields;
+        S.sourceInspection = { tables: parsed.tables, trace: parsed.trace };
+        S.structureEdits.source = {};
         document.getElementById('src-hwpx-box').classList.add('has-file');
         renderSourcePreview();
+        renderStructurePanel('source');
       } catch (e) { showStatus('source-preview', 'error', `추출 실패: ${e.message || e}`); }
     };
 
@@ -254,8 +675,11 @@
         if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
         const result = extractCsv(text);
         S.sourceData = JSON.parse(result.json);
+        S.sourceBytes = null;
+        S.sourceInspection = null;
         document.getElementById('src-csv-box').classList.add('has-file');
         renderSourcePreview();
+        renderStructurePanel('source');
       } catch (e) { showStatus('source-preview', 'error', `CSV 파싱 실패: ${e.message || e}`); }
     };
 
@@ -271,7 +695,10 @@
           value: item.value || '',
           tableIndex: 0, row: 0, col: i,
         }));
+        S.sourceBytes = null;
+        S.sourceInspection = null;
         renderSourcePreview();
+        renderStructurePanel('source');
       } catch (e) { showStatus('source-preview', 'error', `JSON 파싱 실패: ${e.message}`); }
     };
 
@@ -281,11 +708,14 @@
         S.templateBytes = new Uint8Array(await file.arrayBuffer());
         // 대상 양식 구조 (□ 위치 포함) — LLM에 전달할 라벨 구조
         S.templateText = formatForLLM(S.templateBytes);
-        // rules fallback용
-        const result = analyzeForm(S.templateBytes);
-        S.formFields = JSON.parse(result.json);
+        const result = analyzeFormAdaptive(S.templateBytes, recognitionPolicyJson());
+        const parsed = JSON.parse(result.json);
+        S.formFields = parsed.fields;
+        S.templateInspection = { tables: parsed.tables, trace: parsed.trace };
+        S.structureEdits.template = {};
         document.getElementById('tpl-box').classList.add('has-file');
         renderTemplatePreview();
+        renderStructurePanel('template');
       } catch (e) { showStatus('template-preview', 'error', `분석 실패: ${e.message || e}`); }
     };
 
@@ -294,7 +724,7 @@
       document.getElementById(`step${step}`).classList.add('visible');
       updateProgress(step);
       if (step === 3 && (S.sourceData || S.sourceText) && S.templateBytes) await computeMapping();
-      if (step === 4) executeAndDownload();
+      if (step === 4) await executeAndDownload();
     };
 
     window.saveApiKey = () => {
@@ -530,7 +960,7 @@ JSON만 반환:
     async function computeMapping() {
       S.llmLabelPairs = null;
       S.useLlmPath = false;
-      showStatus('mapping-status', 'info', '규칙 기반으로 기본 매핑을 계산하고 있습니다...');
+      showStatus('mapping-status', 'info', '적응형 표 인식 결과를 바탕으로 기본 매핑을 계산하고 있습니다...');
       document.getElementById('llm-status').innerHTML = '';
       renderAiKeyStatus();
 
@@ -582,47 +1012,59 @@ ${templateText}`;
       return JSON.parse(data.content[0].text).label_pairs || [];
     }
 
-    function executeAndDownload() {
-      let output;
-      let filled = 0;
-      let skipped = 0;
-      if (S.useLlmPath && S.sourceBytes && S.llmLabelPairs) {
-        // LLM 경로: 값 조회 + 좌표 계산 모두 WASM 내부에서 완결
-        // JS는 label_pairs만 전달 — 값도 좌표도 JS를 경유하지 않음
-        output = applyLabelMappings(S.sourceBytes, S.templateBytes, JSON.stringify(S.llmLabelPairs));
-        filled = S.editedMappings.filter(m => m.matchType !== 'unmatched' && (m.sourceValue || m.value)).length;
-        skipped = S.editedMappings.length - filled;
-      } else {
-        // Rules 경로: editedMappings의 값으로 fillForm
-        const patches = S.editedMappings
-          .filter(m => m.matchType !== 'unmatched' && (m.sourceValue || m.value))
-          .map(m => ({
-            tableIndex: m.targetTableIndex ?? m.tableIndex ?? 0,
-            row: m.targetRow ?? m.row,
-            col: m.targetCol ?? m.col,
-            value: m.sourceValue || m.value || '',
-          }));
-        output = fillForm(S.templateBytes, JSON.stringify(patches));
-        filled = patches.length;
-        skipped = S.editedMappings.length - filled;
-      }
-      const blob = new Blob([output], { type: 'application/octet-stream' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `filled_${new Date().toISOString().slice(0,10)}.hwpx`;
-      a.click();
-      URL.revokeObjectURL(url);
+    async function executeAndDownload() {
+      try {
+        let output;
+        let filled = 0;
+        let skipped = 0;
+        let touchedTables = [];
+        if (S.useLlmPath && S.sourceBytes && S.llmLabelPairs) {
+          output = applyLabelMappings(S.sourceBytes, S.templateBytes, JSON.stringify(S.llmLabelPairs));
+          filled = S.editedMappings.filter(m => m.matchType !== 'unmatched' && (m.sourceValue || m.value)).length;
+          skipped = S.editedMappings.length - filled;
+          touchedTables = [...new Set(S.editedMappings
+            .filter(m => m.matchType !== 'unmatched')
+            .map(m => Number(m.targetTableIndex ?? m.tableIndex ?? 0)))];
+        } else {
+          const patches = S.editedMappings
+            .filter(m => m.matchType !== 'unmatched' && (m.sourceValue || m.value))
+            .map(m => ({
+              tableIndex: m.targetTableIndex ?? m.tableIndex ?? 0,
+              row: m.targetRow ?? m.row,
+              col: m.targetCol ?? m.col,
+              value: m.sourceValue || m.value || '',
+            }));
+          output = fillForm(S.templateBytes, JSON.stringify(patches));
+          filled = patches.length;
+          skipped = S.editedMappings.length - filled;
+          touchedTables = [...new Set(patches.map(p => Number(p.tableIndex)))];
+        }
+        const blob = new Blob([output], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `filled_${new Date().toISOString().slice(0,10)}.hwpx`;
+        a.click();
+        URL.revokeObjectURL(url);
 
-      document.getElementById('done-summary').innerHTML =
-        `<p style="font-size:18px;font-weight:600;margin-bottom:8px">${filled}개 필드 채움 완료</p>` +
-        `<p style="color:#64748b">${skipped > 0 ? skipped + '개 필드 미매핑 (건너뜀)' : '모든 필드 매핑됨'}</p>`;
+        document.getElementById('done-summary').innerHTML =
+          `<p style="font-size:18px;font-weight:600;margin-bottom:8px">${filled}개 필드 채움 완료</p>` +
+          `<p style="color:#64748b">${skipped > 0 ? skipped + '개 필드 미매핑 (건너뜀)' : '모든 필드 매핑됨'}</p>`;
+        await recordTableOutcome(touchedTables, 'fill_success');
+      } catch (e) {
+        document.getElementById('done-summary').innerHTML =
+          `<p style="font-size:18px;font-weight:600;margin-bottom:8px;color:#991b1b">채움 실패</p>` +
+          `<p style="color:#64748b">${esc(e.message || String(e))}</p>`;
+        const touchedTables = [...new Set((S.editedMappings || []).map(m => Number(m.targetTableIndex ?? m.tableIndex ?? 0)))];
+        await recordTableOutcome(touchedTables, 'fill_failure');
+      }
     }
 
     // ── Render ──
     function renderSourcePreview() {
       if (!S.sourceData?.length) return;
-      let html = `<div class="status status-success">${S.sourceData.length}개 필드 추출됨</div>`;
+      const lowTables = S.sourceInspection?.trace?.filter(t => t.lowConfidence).length || 0;
+      let html = `<div class="status status-success">${S.sourceData.length}개 필드 추출됨${lowTables ? ` · 저신뢰 표 ${lowTables}개` : ''}</div>`;
       html += '<table><thead><tr><th>키</th><th>값</th></tr></thead><tbody>';
       for (const f of S.sourceData) {
         const val = f.value.length > 40 ? f.value.slice(0,40) + '...' : f.value;
@@ -635,7 +1077,8 @@ ${templateText}`;
 
     function renderTemplatePreview() {
       if (!S.formFields?.length) return;
-      let html = `<div class="status status-success">${S.formFields.length}개 필드 감지됨</div>`;
+      const lowTables = S.templateInspection?.trace?.filter(t => t.lowConfidence).length || 0;
+      let html = `<div class="status status-success">${S.formFields.length}개 필드 감지됨${lowTables ? ` · 저신뢰 표 ${lowTables}개` : ''}</div>`;
       html += '<table><thead><tr><th>라벨</th><th>매핑 키</th><th>정확도</th></tr></thead><tbody>';
       for (const f of S.formFields) {
         const conf = f.confidence > 0.8 ? 'badge-green' : 'badge-yellow';

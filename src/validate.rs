@@ -114,3 +114,80 @@ pub fn validate_roundtrip(section: &crate::model::Section) -> Result<ValidationR
         errors,
     })
 }
+
+/// 패치 결과 검증 — 요청한 좌표에 실제 값이 들어갔는지 확인
+pub fn verify_patches_applied(
+    xml: &str,
+    patches: &[(usize, u32, u32, String)],
+) -> ValidationResult {
+    fn norm(s: &str) -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_lowercase()
+    }
+
+    let tables = crate::stream_analyzer::analyze_xml(xml);
+    let mut errors = Vec::new();
+
+    for (table_index, row, col, expected) in patches {
+        if expected.trim().is_empty() {
+            continue;
+        }
+
+        let Some(table) = tables.iter().find(|t| t.index == *table_index) else {
+            errors.push(format!("테이블 {}을(를) 다시 찾지 못함", table_index));
+            continue;
+        };
+
+        let actual = table.rows.iter()
+            .flat_map(|r| &r.cells)
+            .find(|c| c.row == *row && c.col == *col)
+            .map(|c| c.text.clone());
+
+        let Some(actual) = actual else {
+            errors.push(format!("테이블 {} 셀 ({}, {})을(를) 다시 찾지 못함", table_index, row, col));
+            continue;
+        };
+
+        let expected_norm = norm(expected);
+        let actual_norm = norm(&actual);
+        if !actual_norm.contains(&expected_norm) {
+            errors.push(format!(
+                "테이블 {} 셀 ({}, {}) 값 불일치: expected='{}' actual='{}'",
+                table_index, row, col, expected, actual
+            ));
+        }
+    }
+
+    ValidationResult {
+        valid: errors.is_empty(),
+        errors,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_patches_applied;
+
+    #[test]
+    fn verify_patches_applied_catches_missed_patch() {
+        let xml = r#"
+<sec>
+  <tbl rowCnt="1" colCnt="2">
+    <tr>
+      <tc><subList><p><run><t>성 명</t></run></p></subList><cellAddr colAddr="0" rowAddr="0"/></tc>
+      <tc><subList><p><run><t></t></run></p></subList><cellAddr colAddr="1" rowAddr="0"/></tc>
+    </tr>
+  </tbl>
+</sec>
+        "#;
+
+        let ok = verify_patches_applied(xml, &[(0, 0, 0, "성 명".to_string())]);
+        assert!(ok.valid);
+
+        let bad = verify_patches_applied(xml, &[(0, 0, 1, "김보람".to_string())]);
+        assert!(!bad.valid);
+        assert!(bad.errors[0].contains("값 불일치"));
+    }
+}

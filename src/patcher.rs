@@ -65,16 +65,29 @@ fn find_cell_text_position(
     row_addr: u32,
     col_addr: u32,
 ) -> Result<Option<CellTextTarget>> {
-    let mut reader = Reader::from_str(xml);
+    let Some((table_start, table_end)) = find_leaf_table_span(xml, table_index)? else {
+        return Ok(None);
+    };
 
-    let mut current_table = 0usize;
-    let mut table_depth = 0;
-    let mut in_target_table = false;
+    find_cell_text_position_in_leaf_table(
+        &xml[table_start..table_end],
+        table_start,
+        row_addr,
+        col_addr,
+    )
+}
 
-    // 셀 단위 상태
+fn find_cell_text_position_in_leaf_table(
+    table_xml: &str,
+    global_offset: usize,
+    row_addr: u32,
+    col_addr: u32,
+) -> Result<Option<CellTextTarget>> {
+    let mut reader = Reader::from_str(table_xml);
+
     let mut in_cell = false;
     let mut cell_t_positions: Vec<(usize, usize)> = Vec::new();
-    let mut cell_empty_run_pos: Option<usize> = None; // self-closing <hp:run .../> 의 /> 직전 위치
+    let mut cell_empty_run_pos: Option<usize> = None;
     let mut cell_row_addr: Option<u32> = None;
     let mut cell_col_addr: Option<u32> = None;
 
@@ -86,14 +99,7 @@ fn find_cell_text_position(
                 let name = std::str::from_utf8(local.as_ref()).unwrap_or("");
 
                 match name {
-                    "tbl" => {
-                        if table_depth == 0 {
-                            in_target_table = current_table == table_index;
-                            current_table += 1;
-                        }
-                        table_depth += 1;
-                    }
-                    "tc" if in_target_table => {
+                    "tc" => {
                         in_cell = true;
                         cell_t_positions.clear();
                         cell_empty_run_pos = None;
@@ -133,24 +139,26 @@ fn find_cell_text_position(
                             // Case 1: 텍스트가 있는 셀 → 교체
                             if let Some(&(start, end)) = cell_t_positions.first() {
                                 if start != end {
-                                    return Ok(Some(CellTextTarget::ReplaceText(start, end)));
+                                    return Ok(Some(CellTextTarget::ReplaceText(
+                                        global_offset + start,
+                                        global_offset + end,
+                                    )));
                                 }
                             }
                             // Case 2: <hp:t></hp:t> (빈 텍스트) → 삽입 위치 = start
                             if let Some(&(start, _)) = cell_t_positions.first() {
-                                return Ok(Some(CellTextTarget::ReplaceText(start, start)));
+                                return Ok(Some(CellTextTarget::ReplaceText(
+                                    global_offset + start,
+                                    global_offset + start,
+                                )));
                             }
                             // Case 3: self-closing <hp:run/> → 확장 삽입
                             if let Some(pos) = cell_empty_run_pos {
-                                return Ok(Some(CellTextTarget::InsertIntoEmptyRun(pos)));
+                                return Ok(Some(CellTextTarget::InsertIntoEmptyRun(
+                                    global_offset + pos,
+                                )));
                             }
                             return Ok(None);
-                        }
-                    }
-                    "tbl" => {
-                        table_depth -= 1;
-                        if table_depth == 0 {
-                            in_target_table = false;
                         }
                     }
                     _ => {}
@@ -166,7 +174,7 @@ fn find_cell_text_position(
                     // 실제로는 원본 XML에서 이 태그의 위치를 찾아야 함
                     let pos = reader.buffer_position() as usize;
                     // pos는 /> 다음 바이트. 원본에서 "/>" 를 찾아서 "/" 위치를 기록
-                    if pos >= 2 && &xml[pos-2..pos] == "/>" {
+                    if pos >= 2 && &table_xml[pos-2..pos] == "/>" {
                         cell_empty_run_pos = Some(pos - 2); // "/" 위치
                     }
                 }
@@ -219,8 +227,34 @@ pub fn patch_clone_rows(
         return Ok(xml.to_string());
     }
 
-    // Pass 1: quick-xml Reader로 바이트 위치 수집
-    let mut reader = Reader::from_str(xml);
+    let Some((table_start, table_end)) = find_leaf_table_span(xml, table_index)? else {
+        return Err(crate::error::FillerError::RowNotFound {
+            table: table_index,
+            row: template_row_addr,
+        });
+    };
+
+    let patched_fragment = patch_clone_rows_in_leaf_table(
+        &xml[table_start..table_end],
+        table_index,
+        template_row_addr,
+        clone_count,
+    )?;
+
+    let mut result = String::with_capacity(xml.len() + patched_fragment.len());
+    result.push_str(&xml[..table_start]);
+    result.push_str(&patched_fragment);
+    result.push_str(&xml[table_end..]);
+    Ok(result)
+}
+
+fn patch_clone_rows_in_leaf_table(
+    table_xml: &str,
+    table_index: usize,
+    template_row_addr: u32,
+    clone_count: usize,
+) -> Result<String> {
+    let mut reader = Reader::from_str(table_xml);
     let mut positions = RowClonePositions {
         tbl_rowcnt_pos: None,
         tbl_rowcnt_val: 0,
@@ -233,9 +267,6 @@ pub fn patch_clone_rows(
         found: false,
     };
 
-    let mut current_table = 0usize;
-    let mut table_depth = 0;
-    let mut in_target_table = false;
     let mut in_tr = false;
     let mut tr_start_offset = 0usize;
     let mut current_row_addr: Option<u32> = None;
@@ -250,29 +281,22 @@ pub fn patch_clone_rows(
 
                 match name {
                     "tbl" => {
-                        if table_depth == 0 {
-                            in_target_table = current_table == table_index;
-                            if in_target_table {
-                                let tag_end = xml[offset..].find('>').unwrap_or(500);
-                                let tag_raw = &xml[offset..offset + tag_end];
-                                if let Some(rc_match) = find_attr_in_raw(tag_raw, "rowCnt") {
-                                    positions.tbl_rowcnt_pos = Some(offset + rc_match.0);
-                                    positions.tbl_rowcnt_val = rc_match.1;
-                                }
-                                let sz_search = &xml[offset..std::cmp::min(offset + 500, xml.len())];
-                                if let Some(sz_pos) = sz_search.find("hp:sz") {
-                                    let sz_raw = &xml[offset + sz_pos..];
-                                    if let Some(h_match) = find_attr_in_raw(sz_raw, "height") {
-                                        positions.tbl_height_pos = Some(offset + sz_pos + h_match.0);
-                                        positions.tbl_height_val = h_match.1;
-                                    }
-                                }
-                            }
-                            current_table += 1;
+                        let tag_end = table_xml[offset..].find('>').unwrap_or(500);
+                        let tag_raw = &table_xml[offset..offset + tag_end];
+                        if let Some(rc_match) = find_attr_in_raw(tag_raw, "rowCnt") {
+                            positions.tbl_rowcnt_pos = Some(offset + rc_match.0);
+                            positions.tbl_rowcnt_val = rc_match.1;
                         }
-                        table_depth += 1;
+                        let sz_search = &table_xml[offset..std::cmp::min(offset + 500, table_xml.len())];
+                        if let Some(sz_pos) = sz_search.find("hp:sz") {
+                            let sz_raw = &table_xml[offset + sz_pos..];
+                            if let Some(h_match) = find_attr_in_raw(sz_raw, "height") {
+                                positions.tbl_height_pos = Some(offset + sz_pos + h_match.0);
+                                positions.tbl_height_val = h_match.1;
+                            }
+                        }
                     }
-                    "tr" if in_target_table && table_depth == 1 => {
+                    "tr" => {
                         in_tr = true;
                         tr_start_offset = offset;
                         current_row_addr = None;
@@ -284,7 +308,7 @@ pub fn patch_clone_rows(
                 let local = e.local_name();
                 let name = std::str::from_utf8(local.as_ref()).unwrap_or("");
 
-                if name == "cellSz" && in_target_table && in_tr && positions.template_row_height == 0 {
+                if name == "cellSz" && in_tr && positions.template_row_height == 0 {
                     for attr in e.attributes().filter_map(|a| a.ok()) {
                         if attr.key.as_ref() == b"height" {
                             if let Ok(h) = std::str::from_utf8(&attr.value).unwrap_or("0").parse::<u32>() {
@@ -294,7 +318,7 @@ pub fn patch_clone_rows(
                     }
                 }
 
-                if name == "cellAddr" && in_target_table && in_tr && current_row_addr.is_none() {
+                if name == "cellAddr" && in_tr && current_row_addr.is_none() {
                     for attr in e.attributes().filter_map(|a| a.ok()) {
                         if attr.key.as_ref() == b"rowAddr" {
                             current_row_addr = std::str::from_utf8(&attr.value)
@@ -308,7 +332,7 @@ pub fn patch_clone_rows(
                 let local = e.local_name();
                 let name = std::str::from_utf8(local.as_ref()).unwrap_or("");
 
-                if name == "tr" && in_target_table && table_depth == 1 {
+                if name == "tr" {
                     let tr_end_offset = reader.buffer_position() as usize;
 
                     if let Some(addr) = current_row_addr {
@@ -318,7 +342,7 @@ pub fn patch_clone_rows(
                             positions.found = true;
                             past_template = true;
                         } else if past_template {
-                            let row_raw = &xml[tr_start_offset..tr_end_offset];
+                            let row_raw = &table_xml[tr_start_offset..tr_end_offset];
                             collect_row_addr_positions(
                                 row_raw,
                                 tr_start_offset,
@@ -328,16 +352,12 @@ pub fn patch_clone_rows(
                     }
                     in_tr = false;
                 }
-                if name == "tbl" {
-                    table_depth -= 1;
-                    if table_depth == 0 {
-                        in_target_table = false;
-                        past_template = false;
-                    }
-                }
+                if name == "tbl" { past_template = false; }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => return Err(crate::error::FillerError::Validation(
+                format!("XML read error: {}", e)
+            )),
             _ => {}
         }
     }
@@ -350,7 +370,7 @@ pub fn patch_clone_rows(
     }
 
     // Pass 2: 문자열 수준 수정 (뒤에서부터)
-    let mut result = xml.to_string();
+    let mut result = table_xml.to_string();
 
     // 2a. 후속 행들의 rowAddr 시프트 (뒤에서부터)
     for &(pos, old_val) in positions.subsequent_row_addrs.iter().rev() {
@@ -363,7 +383,7 @@ pub fn patch_clone_rows(
     }
 
     // 2b. 클론 행 삽입
-    let template_raw = &xml[positions.template_row_start..positions.template_row_end];
+    let template_raw = &table_xml[positions.template_row_start..positions.template_row_end];
     let mut clones = String::new();
     for i in 1..=clone_count {
         let new_addr = template_row_addr + i as u32;
@@ -414,6 +434,50 @@ pub fn patch_clone_rows_multi(
 }
 
 // ── 헬퍼 ──
+
+fn find_leaf_table_span(xml: &str, target_index: usize) -> Result<Option<(usize, usize)>> {
+    let mut reader = Reader::from_str(xml);
+    let mut stack: Vec<(usize, bool)> = Vec::new(); // (start_offset, has_nested_child)
+    let mut leaf_index = 0usize;
+
+    loop {
+        let offset = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let local = e.local_name();
+                let name = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if name == "tbl" {
+                    if let Some((_, has_nested)) = stack.last_mut() {
+                        *has_nested = true;
+                    }
+                    stack.push((offset, false));
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let local = e.local_name();
+                let name = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                if name == "tbl" {
+                    let end = reader.buffer_position() as usize;
+                    if let Some((start, has_nested)) = stack.pop() {
+                        if !has_nested {
+                            if leaf_index == target_index {
+                                return Ok(Some((start, end)));
+                            }
+                            leaf_index += 1;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(crate::error::FillerError::Validation(
+                format!("XML read error: {}", e)
+            )),
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
 
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -533,4 +597,70 @@ fn rewrite_all_row_addrs(row_raw: &str, new_addr: u32) -> String {
     }
     result.push_str(&row_raw[search_from..]);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{patch_cell_text, patch_clone_rows};
+
+    fn nested_leaf_table_xml() -> &'static str {
+        r#"<hs:sec xmlns:hs="urn:hs" xmlns:hp="urn:hp">
+<hp:tbl id="outer" rowCnt="1" colCnt="1">
+  <hp:tr>
+    <hp:tc>
+      <hp:subList>
+        <hp:p>
+          <hp:run>
+            <hp:tbl id="info" rowCnt="2" colCnt="2">
+              <hp:tr>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t>성 명</hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="0" rowAddr="0"/></hp:tc>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t></hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="1" rowAddr="0"/></hp:tc>
+              </hp:tr>
+              <hp:tr>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t>직 책</hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="0" rowAddr="1"/></hp:tc>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t></hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="1" rowAddr="1"/></hp:tc>
+              </hp:tr>
+            </hp:tbl>
+            <hp:tbl id="projects" rowCnt="3" colCnt="2">
+              <hp:sz width="100" height="300" protect="0"/>
+              <hp:tr>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t>사 업 명</hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="0" rowAddr="0"/></hp:tc>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t>담당업무</hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="1" rowAddr="0"/></hp:tc>
+              </hp:tr>
+              <hp:tr>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t></hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="0" rowAddr="1"/><hp:cellSz height="40"/></hp:tc>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t></hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="1" rowAddr="1"/><hp:cellSz height="40"/></hp:tc>
+              </hp:tr>
+              <hp:tr>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t></hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="0" rowAddr="2"/><hp:cellSz height="40"/></hp:tc>
+                <hp:tc><hp:subList><hp:p><hp:run><hp:t></hp:t></hp:run></hp:p></hp:subList><hp:cellAddr colAddr="1" rowAddr="2"/><hp:cellSz height="40"/></hp:tc>
+              </hp:tr>
+            </hp:tbl>
+          </hp:run>
+        </hp:p>
+      </hp:subList>
+      <hp:cellAddr colAddr="0" rowAddr="0"/>
+    </hp:tc>
+  </hp:tr>
+</hp:tbl>
+</hs:sec>"#
+    }
+
+    #[test]
+    fn patch_cell_text_uses_leaf_table_index() {
+        let xml = nested_leaf_table_xml();
+        let patched = patch_cell_text(xml, 1, 1, 0, "프로젝트 A").expect("patch failed");
+
+        assert!(patched.contains("<hp:t>프로젝트 A</hp:t>"));
+        assert!(patched.contains("<hp:t>성 명</hp:t>"));
+    }
+
+    #[test]
+    fn patch_clone_rows_uses_leaf_table_index() {
+        let xml = nested_leaf_table_xml();
+        let patched = patch_clone_rows(xml, 1, 1, 2).expect("clone failed");
+
+        assert!(patched.contains("rowCnt=\"5\""));
+        assert!(patched.contains("rowAddr=\"4\""));
+    }
 }
