@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>HWPX Form Filler — WASM Demo</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    h1 { font-size: 24px; }
+    .step { margin: 24px 0; padding: 20px; border: 1px solid #e5e7eb; border-radius: 12px; }
+    .step h2 { font-size: 16px; margin: 0 0 12px; }
+    input[type=file] { margin: 8px 0; }
+    button { padding: 10px 20px; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; }
+    button:disabled { background: #ccc; }
+    #fields-table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+    #fields-table th, #fields-table td { padding: 8px; border: 1px solid #e5e7eb; text-align: left; font-size: 13px; }
+    #fields-table th { background: #f3f4f6; }
+    #fields-table input { width: 100%; padding: 4px; border: 1px solid #d1d5db; border-radius: 4px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-green { background: #dcfce7; color: #16a34a; }
+    .badge-yellow { background: #fef9c3; color: #ca8a04; }
+    #status { margin: 12px 0; padding: 12px; border-radius: 8px; }
+    .success { background: #dcfce7; color: #166534; }
+    .error { background: #fee2e2; color: #991b1b; }
+    .info { background: #dbeafe; color: #1e40af; }
+  </style>
+</head>
+<body>
+  <h1>HWPX 양식 자동 채움 <span style="font-size:13px;color:#666">(WASM — 서버 전송 없음)</span></h1>
+  <p style="color:#666;font-size:14px">모든 처리가 브라우저에서 직접 실행됩니다. 개인정보가 서버로 전송되지 않습니다.</p>
+
+  <div class="step">
+    <h2>1. 양식 파일 업로드 (.hwpx)</h2>
+    <input type="file" id="templateFile" accept=".hwpx">
+    <button id="analyzeBtn" disabled onclick="analyze()">양식 분석</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="step" id="fieldsStep" style="display:none">
+    <h2>2. 필드 확인 및 데이터 입력</h2>
+    <table id="fields-table">
+      <thead><tr><th>라벨</th><th>매핑 키</th><th>값</th><th>정확도</th></tr></thead>
+      <tbody id="fields-body"></tbody>
+    </table>
+    <button id="fillBtn" onclick="fill()">채우기 + 다운로드</button>
+  </div>
+
+  <script type="module">
+    import init, { analyzeForm, fillForm } from './pkg/hwpx_filler.js';
+
+    let wasmReady = false;
+    let templateBytes = null;
+    let fields = [];
+
+    // WASM 초기화
+    await init();
+    wasmReady = true;
+    document.getElementById('status').innerHTML = '<span class="badge badge-green">WASM 로드 완료 (605KB)</span>';
+
+    document.getElementById('templateFile').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          templateBytes = new Uint8Array(reader.result);
+          document.getElementById('analyzeBtn').disabled = false;
+        };
+        reader.readAsArrayBuffer(file);
+      }
+    });
+
+    window.analyze = function() {
+      if (!wasmReady || !templateBytes) return;
+      const status = document.getElementById('status');
+
+      try {
+        const t0 = performance.now();
+        const result = analyzeForm(templateBytes);
+        const elapsed = (performance.now() - t0).toFixed(1);
+
+        fields = JSON.parse(result.json);
+        status.className = 'success';
+        status.textContent = `${fields.length}개 필드 감지 (${elapsed}ms)`;
+
+        // 필드 테이블 렌더링
+        const tbody = document.getElementById('fields-body');
+        tbody.innerHTML = '';
+        fields.forEach((f, i) => {
+          const tr = document.createElement('tr');
+          const conf = f.confidence > 0.8 ? 'badge-green' : 'badge-yellow';
+          tr.innerHTML = `
+            <td>${f.label}</td>
+            <td><code>${f.canonicalKey}</code></td>
+            <td><input type="text" id="val-${i}" placeholder="${f.label}"></td>
+            <td><span class="badge ${conf}">${Math.round(f.confidence * 100)}%</span></td>
+          `;
+          tbody.appendChild(tr);
+        });
+
+        document.getElementById('fieldsStep').style.display = 'block';
+      } catch (e) {
+        status.className = 'error';
+        status.textContent = `분석 실패: ${e.message || e}`;
+      }
+    };
+
+    window.fill = function() {
+      if (!wasmReady || !templateBytes) return;
+      const status = document.getElementById('status');
+
+      try {
+        // 입력값 수집
+        const patches = fields.map((f, i) => {
+          const input = document.getElementById(`val-${i}`);
+          return {
+            tableIndex: f.tableIndex,
+            row: f.row,
+            col: f.col,
+            value: input.value || '',
+          };
+        }).filter(p => p.value);
+
+        const t0 = performance.now();
+        const output = fillForm(templateBytes, JSON.stringify(patches));
+        const elapsed = (performance.now() - t0).toFixed(1);
+
+        // 다운로드
+        const blob = new Blob([output], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'filled_form.hwpx';
+        a.click();
+        URL.revokeObjectURL(url);
+
+        status.className = 'success';
+        status.textContent = `${patches.length}개 필드 채움 완료 (${elapsed}ms) — 다운로드됨`;
+      } catch (e) {
+        status.className = 'error';
+        status.textContent = `채움 실패: ${e.message || e}`;
+      }
+    };
+  </script>
+</body>
+</html>

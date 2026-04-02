@@ -21,3 +21,5 @@ pub mod analyzer;
 pub mod zipper;
 pub mod patcher;
 pub mod validate;
+#[cfg(feature = "wasm")]
+pub mod wasm;
