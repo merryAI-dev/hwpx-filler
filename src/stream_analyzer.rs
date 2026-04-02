@@ -438,6 +438,36 @@ pub fn extract_fields(tables: &[TableInfo]) -> Vec<FieldInfo> {
             }
         }
 
+        // Pass 1.5: rowspan 라벨 + 오른쪽 복합 셀 패턴
+        // 예: [학력](rowspan=2) [전공], 다음 행 [대학원 전공]
+        // 이런 셀은 비어 있거나 라벨 조각만 있어도 실제로는 fill target인 경우가 많다.
+        let mut already_mapped: std::collections::HashSet<(u32, u32)> = fields.iter()
+            .filter(|f| f.table_index == table.index)
+            .map(|f| (f.row, f.col))
+            .collect();
+
+        for row in &table.rows {
+            for cell in &row.cells {
+                if already_mapped.contains(&(cell.row, cell.col)) { continue; }
+                if !looks_like_inline_compound_target(table, cell) { continue; }
+
+                let Some(anchor_label) = find_covering_left_label(table, cell) else { continue; };
+                let label = derive_inline_field_label(anchor_label, cell);
+                let key = infer_canonical_key(&label);
+
+                fields.push(FieldInfo {
+                    table_index: table.index,
+                    row: cell.row,
+                    col: cell.col,
+                    label,
+                    canonical_key: key.to_string(),
+                    confidence: if key != "unknown" { 0.72 } else { 0.45 },
+                    content_type: ContentType::Unknown,
+                });
+                already_mapped.insert((cell.row, cell.col));
+            }
+        }
+
         // Pass 2: 세로 패턴 — 헤더 행 감지 + 아래 데이터 행들
         // 헤더 행 조건: 모든 셀이 텍스트 있음 + 바로 아래 행의 셀이 대부분 비어있음
         for (row_idx, row) in table.rows.iter().enumerate() {
@@ -500,6 +530,59 @@ pub fn extract_fields(tables: &[TableInfo]) -> Vec<FieldInfo> {
     }
 
     fields
+}
+
+fn looks_like_inline_compound_target(table: &TableInfo, cell: &CellInfo) -> bool {
+    if cell.text.trim().is_empty() { return false; }
+    if cell.col_span < 2 { return false; }
+    if !cell.is_label { return false; }
+
+    let normalized: String = cell.text.chars().filter(|c| !c.is_whitespace()).collect();
+    if normalized.chars().count() > 20 { return false; }
+
+    let Some(anchor) = find_covering_left_label(table, cell) else { return false; };
+    if anchor.col >= cell.col { return false; }
+    if anchor.row_span < 2 { return false; }
+
+    // 라벨만 있는 넓은 셀 전체를 다 target으로 만들면 오탐이 많다.
+    // "전공", "대학원 전공"처럼 복합 입력 힌트 역할을 하는 짧은 조각만 허용한다.
+    normalized == "전공"
+        || normalized.contains("대학원")
+        || normalized.contains("석사")
+        || normalized.contains("박사")
+        || normalized.contains("학위")
+}
+
+fn find_covering_left_label<'a>(table: &'a TableInfo, cell: &CellInfo) -> Option<&'a CellInfo> {
+    table.rows.iter()
+        .flat_map(|r| &r.cells)
+        .filter(|candidate| {
+            candidate.is_label
+                && candidate.row <= cell.row
+                && cell.row < candidate.row + candidate.row_span
+                && candidate.col + candidate.col_span <= cell.col
+        })
+        .max_by_key(|candidate| (candidate.row, candidate.col + candidate.col_span))
+}
+
+fn derive_inline_field_label(anchor: &CellInfo, cell: &CellInfo) -> String {
+    let anchor_label = anchor.text.trim();
+    let inline = cell.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let inline_norm: String = inline.chars().filter(|c| !c.is_whitespace()).collect();
+
+    if inline_norm == "전공" {
+        return anchor_label.to_string();
+    }
+
+    if inline_norm.contains("대학원") {
+        return inline;
+    }
+
+    if inline.is_empty() {
+        return anchor_label.to_string();
+    }
+
+    format!("{} {}", anchor_label, inline)
 }
 
 /// serde enrichment — 파싱 성공 시 각 필드의 content_type을 갱신
@@ -786,6 +869,67 @@ mod tests {
         "#
     }
 
+    fn inline_rowspan_label_xml() -> &'static str {
+        r#"
+<sec>
+  <p>
+    <run>
+      <tbl rowCnt="3" colCnt="6">
+        <tr>
+          <tc borderFillIDRef="6">
+            <subList><p><run><t>학 력</t></run></p></subList>
+            <cellAddr colAddr="0" rowAddr="0"/>
+            <cellSpan colSpan="1" rowSpan="2"/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="6">
+            <subList><p><run><t>전공</t></run></p></subList>
+            <cellAddr colAddr="1" rowAddr="0"/>
+            <cellSpan colSpan="3" rowSpan="1"/>
+            <cellSz width="300" height="100"/>
+          </tc>
+          <tc borderFillIDRef="6">
+            <subList><p><run><t>보 유자격증</t></run></p></subList>
+            <cellAddr colAddr="4" rowAddr="0"/>
+            <cellSpan colSpan="1" rowSpan="2"/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="6">
+            <subList><p><run><t></t></run></p></subList>
+            <cellAddr colAddr="5" rowAddr="0"/>
+            <cellSpan colSpan="1" rowSpan="2"/>
+            <cellSz width="100" height="100"/>
+          </tc>
+        </tr>
+        <tr>
+          <tc borderFillIDRef="6">
+            <subList><p><run><t>대학원 전공</t></run></p></subList>
+            <cellAddr colAddr="1" rowAddr="1"/>
+            <cellSpan colSpan="3" rowSpan="1"/>
+            <cellSz width="300" height="100"/>
+          </tc>
+        </tr>
+        <tr>
+          <tc borderFillIDRef="6">
+            <subList><p><run><t>참여율</t></run></p></subList>
+            <cellAddr colAddr="0" rowAddr="2"/>
+            <cellSpan colSpan="1" rowSpan="1"/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="6">
+            <subList><p><run><t>0%</t></run></p></subList>
+            <cellAddr colAddr="1" rowAddr="2"/>
+            <cellSpan colSpan="1" rowSpan="1"/>
+            <cellSz width="100" height="100"/>
+          </tc>
+        </tr>
+      </tbl>
+    </run>
+  </p>
+</sec>
+        "#
+    }
+
     #[test]
     fn analyze_xml_prefers_leaf_nested_tables() {
         let tables = analyze_xml(nested_table_xml());
@@ -819,5 +963,15 @@ mod tests {
         assert_eq!(fields[1].value, "수석 컨설턴트");
         assert_eq!(fields[2].key, "company");
         assert_eq!(fields[2].value, "엠와이소셜컴퍼니");
+    }
+
+    #[test]
+    fn extract_fields_detects_inline_rowspan_targets() {
+        let tables = analyze_xml(inline_rowspan_label_xml());
+        let fields = extract_fields(&tables);
+
+        assert!(fields.iter().any(|f| f.row == 0 && f.col == 1 && f.label == "학 력"));
+        assert!(fields.iter().any(|f| f.row == 1 && f.col == 1 && f.label == "대학원 전공"));
+        assert!(fields.iter().any(|f| f.row == 2 && f.col == 1 && f.label == "참여율"));
     }
 }
