@@ -36,6 +36,26 @@ pub struct TableInfo {
     pub rows: Vec<RowInfo>,
 }
 
+/// 셀 내용물 타입 — serde enrichment로 알 수 있는 것
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentType {
+    /// 순수 텍스트만 — 교체 안전
+    TextOnly,
+    /// 그림 포함 — 텍스트 교체 시 그림 손상 위험
+    HasPicture,
+    /// 수식 포함 — 건드리지 말 것
+    HasEquation,
+    /// 폼 컨트롤 (btn, checkBtn, edit 등) — 특수 처리 필요
+    HasFormControl,
+    /// 도형 (line, rect, ellipse 등) — 건드리지 말 것
+    HasDrawing,
+    /// 텍스트 + 기타 혼합
+    Mixed,
+    /// serde 파싱 실패로 알 수 없음 (streaming fallback)
+    Unknown,
+}
+
 /// 분석된 필드 (label → data 매핑)
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +66,9 @@ pub struct FieldInfo {
     pub label: String,
     pub canonical_key: String,
     pub confidence: f32,
+    /// 이 data 셀에 어떤 내용이 있는지 (serde enrichment)
+    /// Unknown이면 serde 파싱 실패 — streaming 결과만 사용 중
+    pub content_type: ContentType,
 }
 
 /// XML을 스트리밍하면서 테이블 구조 추출 — 어떤 HWPX든 동작
@@ -227,6 +250,7 @@ pub fn extract_fields(tables: &[TableInfo]) -> Vec<FieldInfo> {
                             label: cell.text.clone(),
                             canonical_key: key.to_string(),
                             confidence: if key != "unknown" { 0.95 } else { 0.5 },
+                            content_type: ContentType::Unknown, // serde enrichment에서 갱신
                         });
                     }
                 }
@@ -235,6 +259,90 @@ pub fn extract_fields(tables: &[TableInfo]) -> Vec<FieldInfo> {
     }
 
     fields
+}
+
+/// serde enrichment — 파싱 성공 시 각 필드의 content_type을 갱신
+///
+/// streaming 분석은 텍스트만 보지만, serde는 셀 안의 Picture, Equation,
+/// FormControl 등을 타입으로 구분할 수 있다.
+/// serde 파싱이 실패하면 이 함수를 호출하지 않으면 됨 — content_type은 Unknown으로 남음.
+pub fn enrich_with_serde(fields: &mut [FieldInfo], xml: &str) {
+    let section = match crate::parser::parse_section(xml) {
+        Ok(s) => s,
+        Err(_) => return, // serde 실패 → enrichment 없이 진행
+    };
+
+    // serde 모델에서 테이블 추출
+    let serde_tables: Vec<&crate::model::Table> = section.paragraphs.iter()
+        .flat_map(|p| &p.runs)
+        .flat_map(|r| &r.contents)
+        .filter_map(|c| match c {
+            crate::model::RunContent::Table(t) => Some(t.as_ref()),
+            _ => None,
+        })
+        .collect();
+
+    for field in fields.iter_mut() {
+        if field.table_index >= serde_tables.len() {
+            continue;
+        }
+
+        let table = serde_tables[field.table_index];
+        if let Some(cell) = table.get_cell(field.row, field.col) {
+            field.content_type = classify_cell_content(cell);
+        }
+    }
+}
+
+/// serde TableCell의 RunContent를 분석해서 ContentType 결정
+fn classify_cell_content(cell: &crate::model::TableCell) -> ContentType {
+    use crate::model::RunContent;
+
+    let mut has_text = false;
+    let mut has_other = false;
+    let mut specific_type: Option<ContentType> = None;
+
+    for para in &cell.sub_list.paragraphs {
+        for run in &para.runs {
+            for content in &run.contents {
+                match content {
+                    RunContent::Text(_) => has_text = true,
+                    RunContent::Picture(_) => {
+                        has_other = true;
+                        specific_type = Some(ContentType::HasPicture);
+                    }
+                    RunContent::Equation(_) => {
+                        has_other = true;
+                        specific_type = Some(ContentType::HasEquation);
+                    }
+                    RunContent::Button(_) | RunContent::RadioButton(_) |
+                    RunContent::CheckButton(_) | RunContent::ComboBox(_) |
+                    RunContent::ListBox(_) | RunContent::Edit(_) |
+                    RunContent::ScrollBar(_) => {
+                        has_other = true;
+                        specific_type = Some(ContentType::HasFormControl);
+                    }
+                    RunContent::Line(_) | RunContent::Rectangle(_) |
+                    RunContent::Ellipse(_) | RunContent::Arc(_) |
+                    RunContent::Polygon(_) | RunContent::Curve(_) |
+                    RunContent::ConnectLine(_) => {
+                        has_other = true;
+                        specific_type = Some(ContentType::HasDrawing);
+                    }
+                    // Table, SectionDef, TextArt, Ole 등은 무시
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if has_text && has_other {
+        ContentType::Mixed
+    } else if has_other {
+        specific_type.unwrap_or(ContentType::Unknown)
+    } else {
+        ContentType::TextOnly
+    }
 }
 
 // ── 헬퍼 ──

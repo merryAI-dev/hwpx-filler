@@ -40,7 +40,7 @@ fn main() {
 
     println!("\n   Fields: {}", result.fields.len());
     for f in &result.fields {
-        println!("     {} → {} ({}%)", f.label, f.canonical_key, (f.confidence * 100.0) as u32);
+        println!("     {} → {} ({}%) [{:?}]", f.label, f.canonical_key, (f.confidence * 100.0) as u32, f.content_type);
     }
 
     // 3. Fill + validate + save
