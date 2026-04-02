@@ -71,8 +71,26 @@ pub struct FieldInfo {
     pub content_type: ContentType,
 }
 
-/// XML을 스트리밍하면서 테이블 구조 추출 — 어떤 HWPX든 동작
+/// XML에서 테이블 구조 추출
+///
+/// 기본은 streaming 파서로 처리하지만, 중첩 테이블이 있는 문서는
+/// serde 모델을 따라 leaf table만 재귀적으로 추출한다.
+/// 서식 3-5처럼 "바깥 1x1 래퍼 + 안쪽 실제 테이블" 구조를 위해 필요하다.
 pub fn analyze_xml(xml: &str) -> Vec<TableInfo> {
+    if let Ok(section) = crate::parser::parse_section(xml) {
+        if section_has_nested_tables(&section) {
+            let nested_tables = analyze_nested_tables_with_serde(&section);
+            if !nested_tables.is_empty() {
+                return nested_tables;
+            }
+        }
+    }
+
+    analyze_xml_streaming(xml)
+}
+
+/// XML을 스트리밍하면서 테이블 구조 추출 — 어떤 HWPX든 동작
+fn analyze_xml_streaming(xml: &str) -> Vec<TableInfo> {
     let mut reader = Reader::from_str(xml);
     let mut tables: Vec<TableInfo> = Vec::new();
 
@@ -116,7 +134,7 @@ pub fn analyze_xml(xml: &str) -> Vec<TableInfo> {
                         in_row = true;
                         current_row = RowInfo { cells: Vec::new() };
                     }
-                    "tc" if in_row => {
+                    "tc" if in_row && table_depth == 1 => {
                         in_cell = true;
                         current_cell = Some(CellInfo {
                             row: 0, col: 0,
@@ -193,7 +211,9 @@ pub fn analyze_xml(xml: &str) -> Vec<TableInfo> {
                         in_row = false;
                     }
                     "tbl" => {
-                        table_depth -= 1;
+                        if table_depth > 0 {
+                            table_depth -= 1;
+                        }
                         if table_depth == 0 && in_table {
                             // Pass 2: borderFillIDRef 기반 label 보정
                             // 보수적 기준: 이 fill style이 데이터 셀에 한 번도 나타나지 않을 때만 프로모션.
@@ -231,6 +251,161 @@ pub fn analyze_xml(xml: &str) -> Vec<TableInfo> {
     }
 
     tables
+}
+
+fn section_has_nested_tables(section: &crate::model::Section) -> bool {
+    collect_root_tables(section)
+        .into_iter()
+        .any(table_contains_nested_tables)
+}
+
+fn analyze_nested_tables_with_serde(section: &crate::model::Section) -> Vec<TableInfo> {
+    let mut tables = Vec::new();
+    let mut next_index = 0usize;
+
+    for table in collect_root_tables(section) {
+        collect_leaf_tables(table, &mut tables, &mut next_index);
+    }
+
+    tables
+}
+
+fn collect_leaf_table_refs<'a>(
+    table: &'a crate::model::Table,
+    out: &mut Vec<&'a crate::model::Table>,
+) {
+    let mut has_nested = false;
+
+    for para in table.rows.iter().flat_map(|r| &r.cells).flat_map(|c| &c.sub_list.paragraphs) {
+        for run in &para.runs {
+            for content in &run.contents {
+                if let crate::model::RunContent::Table(nested) = content {
+                    has_nested = true;
+                    collect_leaf_table_refs(nested.as_ref(), out);
+                }
+            }
+        }
+    }
+
+    if !has_nested {
+        out.push(table);
+    }
+}
+
+fn collect_leaf_root_tables<'a>(section: &'a crate::model::Section) -> Vec<&'a crate::model::Table> {
+    let mut out = Vec::new();
+    for table in collect_root_tables(section) {
+        collect_leaf_table_refs(table, &mut out);
+    }
+    out
+}
+
+fn collect_root_tables(section: &crate::model::Section) -> Vec<&crate::model::Table> {
+    section.paragraphs.iter()
+        .flat_map(|p| &p.runs)
+        .flat_map(|r| &r.contents)
+        .filter_map(|c| match c {
+            crate::model::RunContent::Table(t) => Some(t.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn table_contains_nested_tables(table: &crate::model::Table) -> bool {
+    table.rows.iter()
+        .flat_map(|r| &r.cells)
+        .flat_map(|c| &c.sub_list.paragraphs)
+        .flat_map(|p| &p.runs)
+        .flat_map(|r| &r.contents)
+        .any(|c| matches!(c, crate::model::RunContent::Table(_)))
+}
+
+fn collect_leaf_tables(
+    table: &crate::model::Table,
+    out: &mut Vec<TableInfo>,
+    next_index: &mut usize,
+) {
+    let mut has_nested = false;
+
+    for para in table.rows.iter().flat_map(|r| &r.cells).flat_map(|c| &c.sub_list.paragraphs) {
+        for run in &para.runs {
+            for content in &run.contents {
+                if let crate::model::RunContent::Table(nested) = content {
+                    has_nested = true;
+                    collect_leaf_tables(nested.as_ref(), out, next_index);
+                }
+            }
+        }
+    }
+
+    if !has_nested {
+        let index = *next_index;
+        *next_index += 1;
+        out.push(table_info_from_serde(table, index));
+    }
+}
+
+fn table_info_from_serde(table: &crate::model::Table, index: usize) -> TableInfo {
+    let mut info = TableInfo {
+        index,
+        row_count: table.row_count.unwrap_or(table.rows.len() as u32),
+        col_count: table.col_count.unwrap_or_else(|| {
+            table.rows.iter()
+                .flat_map(|r| &r.cells)
+                .map(|c| c.cell_addr.col + c.cell_span.col_span)
+                .max()
+                .unwrap_or(0)
+        }),
+        rows: table.rows.iter().map(|row| {
+            RowInfo {
+                cells: row.cells.iter().map(|cell| CellInfo {
+                    row: cell.cell_addr.row,
+                    col: cell.cell_addr.col,
+                    col_span: cell.cell_span.col_span,
+                    row_span: cell.cell_span.row_span,
+                    border_fill_id_ref: cell.border_fill_id_ref.clone().unwrap_or_default(),
+                    text: cell.text().trim().to_string(),
+                    is_label: false,
+                }).collect(),
+            }
+        }).collect(),
+    };
+
+    classify_labels_in_table(&mut info);
+    info
+}
+
+fn classify_labels_in_table(table: &mut TableInfo) {
+    let mut bf_label_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut bf_data_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for row in &mut table.rows {
+        for cell in &mut row.cells {
+            cell.is_label = is_korean_label(&cell.text);
+            let bf = cell.border_fill_id_ref.clone();
+            if cell.is_label {
+                *bf_label_count.entry(bf).or_insert(0) += 1;
+            } else if !cell.text.is_empty() {
+                *bf_data_count.entry(bf).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let label_fills: std::collections::HashSet<String> = bf_label_count.iter()
+        .filter(|(bf, _)| {
+            let data = bf_data_count.get(*bf).unwrap_or(&0);
+            *data == 0
+        })
+        .map(|(bf, _)| bf.clone())
+        .collect();
+
+    for row in &mut table.rows {
+        for cell in &mut row.cells {
+            if !cell.is_label && !cell.text.is_empty() && label_fills.contains(&cell.border_fill_id_ref) {
+                cell.is_label = true;
+            }
+        }
+    }
 }
 
 /// 테이블에서 label→data 필드 매핑 추출
@@ -338,15 +513,8 @@ pub fn enrich_with_serde(fields: &mut [FieldInfo], xml: &str) {
         Err(_) => return, // serde 실패 → enrichment 없이 진행
     };
 
-    // serde 모델에서 테이블 추출
-    let serde_tables: Vec<&crate::model::Table> = section.paragraphs.iter()
-        .flat_map(|p| &p.runs)
-        .flat_map(|r| &r.contents)
-        .filter_map(|c| match c {
-            crate::model::RunContent::Table(t) => Some(t.as_ref()),
-            _ => None,
-        })
-        .collect();
+    // analyze_xml()와 동일한 leaf-table 순서를 사용해야 table_index가 맞는다.
+    let serde_tables = collect_leaf_root_tables(&section);
 
     for field in fields.iter_mut() {
         if field.table_index >= serde_tables.len() {
@@ -456,7 +624,8 @@ fn is_korean_label(text: &str) -> bool {
     if char_count > 20 { return false; }
 
     // 1. 키워드 매칭 — 한국 공문서에서 흔한 필드명
-    // kordoc 키워드 + 우리 기존 키워드 병합
+    // "전공" 같은 짧은 키워드가 긴 데이터 텍스트에 포함될 수 있으므로
+    // 지나치게 긴 문자열에는 contains 매칭을 적용하지 않는다.
     let keywords = [
         // 인적사항
         "성명", "이름", "소속", "직책", "직위", "직급", "부서",
@@ -467,7 +636,7 @@ fn is_korean_label(text: &str) -> bool {
         "경력", "유사경력", "자격증", "근무경력",
         "참여임무", "참여기간", "사업참여기간", "참여율",
         "회사명", "근무기간", "담당업무", "비고", "발주처",
-        "프로젝트", "상세경력", "사업명", "사업개요",
+        "상세경력", "사업명", "사업개요",
         "투입기간", "기술분야", "관련기술", "담당임무", "전문분야",
         // 이름/언어 구분
         "국문", "영문",
@@ -478,7 +647,9 @@ fn is_korean_label(text: &str) -> bool {
         "일시", "날짜", "기간", "장소", "목적", "사유",
         "금액", "수량", "단가", "합계",
     ];
-    if keywords.iter().any(|kw| normalized.contains(kw)) {
+    if keywords.iter().any(|kw| {
+        normalized == *kw || (char_count <= 10 && normalized.contains(kw))
+    }) {
         return true;
     }
 
@@ -492,10 +663,11 @@ fn is_korean_label(text: &str) -> bool {
     let original_trimmed = text.trim();
     let words: Vec<&str> = original_trimmed.split_whitespace().collect();
     if words.len() >= 2 && words.len() <= 4 {
-        // "성 명", "직 책", "학 력", "비 고" — 각 단어가 1-4자 한글
+        // "성 명", "직 책", "학 력", "비 고"처럼 각 음절이 띄어진 패턴만 허용.
+        // "수석 컨설턴트", "사업 관리 및 멘토링" 같은 정상 데이터는 제외해야 한다.
         let all_short_korean = words.iter().all(|w| {
             let wlen = w.chars().count();
-            wlen >= 1 && wlen <= 4 && w.chars().all(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c))
+            wlen == 1 && w.chars().all(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c))
         });
         let no_digits = !original_trimmed.chars().any(|c| c.is_ascii_digit());
         if all_short_korean && no_digits {
@@ -540,4 +712,112 @@ fn infer_canonical_key(label: &str) -> &'static str {
         if patterns.iter().any(|p| t.contains(p)) { return key; }
     }
     "unknown"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nested_table_xml() -> &'static str {
+        r#"
+<sec>
+  <p>
+    <run>
+      <tbl rowCnt="1" colCnt="1">
+        <tr>
+          <tc borderFillIDRef="1">
+            <subList>
+              <p>
+                <run>
+                  <tbl rowCnt="2" colCnt="4">
+                    <tr>
+                      <tc borderFillIDRef="6">
+                        <subList><p><run><t>성 명</t></run></p></subList>
+                        <cellAddr colAddr="0" rowAddr="0"/>
+                        <cellSpan/>
+                        <cellSz width="100" height="100"/>
+                      </tc>
+                      <tc borderFillIDRef="6">
+                        <subList><p><run><t>김영우</t></run></p></subList>
+                        <cellAddr colAddr="1" rowAddr="0"/>
+                        <cellSpan/>
+                        <cellSz width="100" height="100"/>
+                      </tc>
+                      <tc borderFillIDRef="6">
+                        <subList><p><run><t>직 책</t></run></p></subList>
+                        <cellAddr colAddr="2" rowAddr="0"/>
+                        <cellSpan/>
+                        <cellSz width="100" height="100"/>
+                      </tc>
+                      <tc borderFillIDRef="6">
+                        <subList><p><run><t>수석 컨설턴트</t></run></p></subList>
+                        <cellAddr colAddr="3" rowAddr="0"/>
+                        <cellSpan/>
+                        <cellSz width="100" height="100"/>
+                      </tc>
+                    </tr>
+                    <tr>
+                      <tc borderFillIDRef="6">
+                        <subList><p><run><t>소속 회사</t></run></p></subList>
+                        <cellAddr colAddr="0" rowAddr="1"/>
+                        <cellSpan/>
+                        <cellSz width="100" height="100"/>
+                      </tc>
+                      <tc borderFillIDRef="6">
+                        <subList><p><run><t>엠와이소셜컴퍼니</t></run></p></subList>
+                        <cellAddr colAddr="1" rowAddr="1"/>
+                        <cellSpan colSpan="3" rowSpan="1"/>
+                        <cellSz width="300" height="100"/>
+                      </tc>
+                    </tr>
+                  </tbl>
+                </run>
+              </p>
+            </subList>
+            <cellAddr colAddr="0" rowAddr="0"/>
+            <cellSpan/>
+            <cellSz width="400" height="200"/>
+          </tc>
+        </tr>
+      </tbl>
+    </run>
+  </p>
+</sec>
+        "#
+    }
+
+    #[test]
+    fn analyze_xml_prefers_leaf_nested_tables() {
+        let tables = analyze_xml(nested_table_xml());
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].row_count, 2);
+        assert_eq!(tables[0].col_count, 4);
+        assert_eq!(tables[0].rows[0].cells[0].text, "성 명");
+        assert_eq!(tables[0].rows[0].cells[1].text, "김영우");
+    }
+
+    #[test]
+    fn extract_fields_from_nested_leaf_table() {
+        let tables = analyze_xml(nested_table_xml());
+        let fields = extract_fields(&tables);
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].label, "성 명");
+        assert_eq!(fields[0].canonical_key, "name");
+        assert_eq!(fields[1].label, "직 책");
+        assert_eq!(fields[1].canonical_key, "position");
+        assert_eq!(fields[2].label, "소속 회사");
+        assert_eq!(fields[2].canonical_key, "company");
+    }
+
+    #[test]
+    fn extract_data_from_nested_leaf_table() {
+        let fields = crate::extractor::extract_data(nested_table_xml());
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].key, "name");
+        assert_eq!(fields[0].value, "김영우");
+        assert_eq!(fields[1].key, "position");
+        assert_eq!(fields[1].value, "수석 컨설턴트");
+        assert_eq!(fields[2].key, "company");
+        assert_eq!(fields[2].value, "엠와이소셜컴퍼니");
+    }
 }

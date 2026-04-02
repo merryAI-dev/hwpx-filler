@@ -35,7 +35,12 @@ pub fn extract_data(xml: &str) -> Vec<ExtractedField> {
 
     for table in &tables {
         // Pass 1: 가로 패턴 — [Label] [Data] 같은 행
-        for row in &table.rows {
+        for (row_idx, row) in table.rows.iter().enumerate() {
+            let next_row = table.rows.get(row_idx + 1);
+            if looks_like_vertical_header_row(row, next_row) {
+                continue;
+            }
+
             for (i, cell) in row.cells.iter().enumerate() {
                 if !cell.is_label { continue; }
                 if cell.text.trim().is_empty() { continue; }
@@ -74,20 +79,10 @@ pub fn extract_data(xml: &str) -> Vec<ExtractedField> {
             let row_addr = row.cells.first().map(|c| c.row).unwrap_or(0);
             if horizontal_rows.contains(&row_addr) { continue; }
 
-            // 헤더 행 감지: 모든 셀에 텍스트 있음
-            let all_have_text = row.cells.iter().all(|c| !c.text.trim().is_empty());
-            if !all_have_text { continue; }
-
             let next_row = table.rows.get(row_idx + 1);
-
-            // 다음 행이 없거나 비어 있으면 건너뜀 (데이터 없음)
-            // 주의: "다음 행도 전부 label"인 경우를 연속 헤더로 건너뛰면
-            //   borderFillIDRef 오분류(서식3-5)로 인해 헤더 감지가 실패할 수 있으므로
-            //   이 체크는 제거한다.
-            let next_has_any = next_row.map(|r| {
-                r.cells.iter().any(|c| !c.text.trim().is_empty())
-            }).unwrap_or(false);
-            if !next_has_any { continue; }
+            if !looks_like_vertical_header_row(row, next_row) {
+                continue;
+            }
 
             let header_cells: Vec<_> = row.cells.iter().collect();
 
@@ -132,6 +127,28 @@ pub fn extract_data(xml: &str) -> Vec<ExtractedField> {
     }
 
     fields
+}
+
+fn looks_like_vertical_header_row(
+    row: &stream_analyzer::RowInfo,
+    next_row: Option<&stream_analyzer::RowInfo>,
+) -> bool {
+    let non_empty: Vec<_> = row.cells.iter()
+        .filter(|c| !c.text.trim().is_empty())
+        .collect();
+    if non_empty.len() < 3 {
+        return false;
+    }
+
+    let next_has_any = next_row.map(|r| {
+        r.cells.iter().any(|c| !c.text.trim().is_empty())
+    }).unwrap_or(false);
+    if !next_has_any {
+        return false;
+    }
+
+    let label_count = non_empty.iter().filter(|c| c.is_label).count();
+    label_count * 3 >= non_empty.len() * 2
 }
 
 /// HWPX에서 추출한 데이터를 다른 양식에 매핑
@@ -381,4 +398,102 @@ fn canonical_or_normalized(normalized: &str) -> String {
     }
 
     normalized.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vertical_table_xml() -> &'static str {
+        r#"
+<sec>
+  <p>
+    <run>
+      <tbl rowCnt="4" colCnt="3">
+        <tr>
+          <tc borderFillIDRef="1">
+            <subList><p><run><t>주요 프로젝트 수행 경험</t></run></p></subList>
+            <cellAddr colAddr="0" rowAddr="0"/>
+            <cellSpan colSpan="3" rowSpan="1"/>
+            <cellSz width="300" height="100"/>
+          </tc>
+        </tr>
+        <tr>
+          <tc borderFillIDRef="1">
+            <subList><p><run><t>사 업 명</t></run></p></subList>
+            <cellAddr colAddr="0" rowAddr="1"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="1">
+            <subList><p><run><t>참여기간 ( 년 월～ 년 월)</t></run></p></subList>
+            <cellAddr colAddr="1" rowAddr="1"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="1">
+            <subList><p><run><t>담당업무</t></run></p></subList>
+            <cellAddr colAddr="2" rowAddr="1"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+        </tr>
+        <tr>
+          <tc borderFillIDRef="2">
+            <subList><p><run><t>프로젝트 A</t></run></p></subList>
+            <cellAddr colAddr="0" rowAddr="2"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="2">
+            <subList><p><run><t>24.01 ~ 24.03</t></run></p></subList>
+            <cellAddr colAddr="1" rowAddr="2"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="2">
+            <subList><p><run><t>운영</t></run></p></subList>
+            <cellAddr colAddr="2" rowAddr="2"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+        </tr>
+        <tr>
+          <tc borderFillIDRef="2">
+            <subList><p><run><t>프로젝트 B</t></run></p></subList>
+            <cellAddr colAddr="0" rowAddr="3"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="2">
+            <subList><p><run><t>24.04 ~ 24.06</t></run></p></subList>
+            <cellAddr colAddr="1" rowAddr="3"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+          <tc borderFillIDRef="2">
+            <subList><p><run><t>기획</t></run></p></subList>
+            <cellAddr colAddr="2" rowAddr="3"/>
+            <cellSpan/>
+            <cellSz width="100" height="100"/>
+          </tc>
+        </tr>
+      </tbl>
+    </run>
+  </p>
+</sec>
+        "#
+    }
+
+    #[test]
+    fn extract_data_prefers_vertical_header_over_bogus_horizontal_pair() {
+        let fields = extract_data(vertical_table_xml());
+
+        assert!(fields.iter().any(|f| f.raw_label == "사 업 명" && f.value == "프로젝트 A"));
+        assert!(fields.iter().any(|f| f.raw_label == "참여기간 ( 년 월～ 년 월)" && f.value == "24.01 ~ 24.03"));
+        assert!(fields.iter().any(|f| f.raw_label == "담당업무" && f.value == "운영"));
+        assert!(!fields.iter().any(|f| f.raw_label == "사 업 명" && f.value == "참여기간 ( 년 월～ 년 월)"));
+        assert!(!fields.iter().any(|f| f.raw_label == "24.01 ~ 24.03" && f.value == "24.04 ~ 24.06"));
+        assert!(!fields.iter().any(|f| f.raw_label == "운영" && f.value == "기획"));
+    }
 }
