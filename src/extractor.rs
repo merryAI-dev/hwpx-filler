@@ -34,17 +34,85 @@ pub fn extract_data(xml: &str) -> Vec<ExtractedField> {
     let mut fields = Vec::new();
 
     for table in &tables {
+        // Pass 1: 가로 패턴 — [Label] [Data] 같은 행
         for row in &table.rows {
             for (i, cell) in row.cells.iter().enumerate() {
                 if !cell.is_label { continue; }
                 if cell.text.trim().is_empty() { continue; }
 
-                // 오른쪽에 data 셀이 있는지
                 if let Some(data_cell) = row.cells.get(i + 1) {
                     if !data_cell.is_label && !data_cell.text.trim().is_empty() {
                         let raw = cell.text.trim().to_string();
                         let normalized = normalize_label(&raw);
                         let key = canonical_or_normalized(&normalized);
+
+                        fields.push(ExtractedField {
+                            raw_label: raw,
+                            normalized_label: normalized,
+                            key,
+                            value: data_cell.text.trim().to_string(),
+                            table_index: table.index,
+                            row: data_cell.row,
+                            col: data_cell.col,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Pass 1에서 추출된 행 기록 — 세로 패턴에서 중복 방지
+        let horizontal_rows: std::collections::HashSet<u32> = fields.iter()
+            .filter(|f| f.table_index == table.index)
+            .map(|f| f.row)
+            .collect();
+
+        // Pass 2: 세로 패턴 — 헤더 행 아래 데이터 행에서 값 추출
+        for (row_idx, row) in table.rows.iter().enumerate() {
+            if row.cells.is_empty() || row.cells.len() < 3 { continue; } // 최소 3열
+
+            // 이 행이 가로 패턴에서 이미 추출된 행이면 건너뜀
+            let row_addr = row.cells.first().map(|c| c.row).unwrap_or(0);
+            if horizontal_rows.contains(&row_addr) { continue; }
+
+            // 헤더 행 감지: 모든 셀에 텍스트 있음
+            let all_have_text = row.cells.iter().all(|c| !c.text.trim().is_empty());
+            if !all_have_text { continue; }
+
+            let next_row = table.rows.get(row_idx + 1);
+
+            // 다음 행도 전부 label이면 연속 헤더이므로 건너뜀
+            let next_all_labels = next_row.map(|r| {
+                let non_empty: Vec<_> = r.cells.iter().filter(|c| !c.text.trim().is_empty()).collect();
+                !non_empty.is_empty() && non_empty.iter().all(|c| c.is_label)
+            }).unwrap_or(true);
+            if next_all_labels { continue; }
+
+            let header_cells: Vec<_> = row.cells.iter().collect();
+
+            // 아래 데이터 행들에서 값 추출
+            for data_row in table.rows.iter().skip(row_idx + 1) {
+                let has_any_data = data_row.cells.iter().any(|c| !c.text.trim().is_empty());
+                if !has_any_data { continue; } // 완전 빈 행은 건너뜀
+
+                // 다음 헤더 행이면 중단
+                let mostly_labels = data_row.cells.iter()
+                    .filter(|c| !c.text.trim().is_empty())
+                    .all(|c| c.is_label);
+                if mostly_labels && has_any_data { break; }
+
+                // 행 번호 (0-based, 헤더 이후 몇 번째 데이터인지)
+                let data_row_num = data_row.cells.first().map(|c| c.row).unwrap_or(0);
+
+                for data_cell in &data_row.cells {
+                    if data_cell.text.trim().is_empty() { continue; }
+
+                    // 같은 col의 헤더 셀 찾기
+                    if let Some(header_cell) = header_cells.iter().find(|h| h.col == data_cell.col) {
+                        let raw = header_cell.text.trim().to_string();
+                        let normalized = normalize_label(&raw);
+                        let base_key = canonical_or_normalized(&normalized);
+                        // 같은 헤더에 여러 행 데이터면 key에 행 번호 추가
+                        let key = format!("{}_{}", base_key, data_row_num);
 
                         fields.push(ExtractedField {
                             raw_label: raw,
