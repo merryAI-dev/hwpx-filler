@@ -96,6 +96,17 @@
     <h1>HWPX 양식 자동 채움</h1>
     <p class="subtitle">모든 처리는 브라우저에서 실행됩니다. 개인정보가 서버로 전송되지 않습니다.</p>
 
+    <!-- API Key (최상단) -->
+    <div id="api-setup" style="margin-bottom:20px;padding:16px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-size:13px;font-weight:600;white-space:nowrap">Anthropic API Key</span>
+        <input type="password" id="api-key-top" placeholder="sk-ant-..." style="flex:1;min-width:200px;padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px" />
+        <button class="btn btn-outline" onclick="saveApiKeyTop()" style="padding:6px 14px;font-size:13px">저장</button>
+        <span id="api-key-status" style="font-size:12px;color:#64748b"></span>
+      </div>
+      <p style="font-size:11px;color:#94a3b8;margin-top:6px">LLM이 양식 구조를 분석하고 자동 매핑합니다. 키가 없으면 규칙 기반으로 동작합니다.</p>
+    </div>
+
     <!-- Progress Bar -->
     <div class="progress">
       <div class="progress-step"><div class="progress-circle active" id="pc1">1</div></div>
@@ -162,14 +173,8 @@
       <p class="step-desc">자동 매핑 결과를 확인하고, 필요하면 수정하세요.</p>
       <div id="mapping-status"></div>
       <div id="mapping-table-wrap"></div>
-      <div class="llm-section" id="llm-section">
-        <h3>LLM 매핑 (API 키 필요)</h3>
-        <p style="font-size:12px;color:#64748b;margin-bottom:8px">테이블 구조만 전송됩니다. API 키가 있으면 LLM이 자동 매핑하고, 없으면 규칙 기반으로 동작합니다.</p>
-        <div class="api-key-input">
-          <input type="password" id="api-key" placeholder="Anthropic API Key" />
-          <button class="btn btn-outline" onclick="saveApiKey()">저장</button>
-        </div>
-        <button class="btn btn-primary" onclick="llmAssist()">LLM Assist 실행</button>
+      <div class="llm-section" id="llm-section" style="display:none">
+        <p style="font-size:12px;color:#64748b">미매핑 필드가 있습니다. 위에서 수동으로 선택하세요.</p>
         <div id="llm-status"></div>
       </div>
       <div class="btn-row">
@@ -281,10 +286,26 @@
       if (step === 4) executeAndDownload();
     };
 
-    window.saveApiKey = () => {
-      const key = document.getElementById('api-key').value.trim();
-      if (key) { localStorage.setItem('anthropic_api_key', key); showStatus('llm-status', 'success', 'API 키 저장됨'); }
+    window.saveApiKeyTop = () => {
+      const key = document.getElementById('api-key-top').value.trim();
+      if (key) {
+        localStorage.setItem('anthropic_api_key', key);
+        document.getElementById('api-key-status').textContent = '✓ 저장됨';
+        document.getElementById('api-key-status').style.color = '#16a34a';
+      }
     };
+
+    // 페이지 로드 시 저장된 키 복원
+    {
+      const saved = localStorage.getItem('anthropic_api_key');
+      if (saved) {
+        document.getElementById('api-key-top').value = saved;
+        document.getElementById('api-key-status').textContent = '✓ 저장됨';
+        document.getElementById('api-key-status').style.color = '#16a34a';
+      }
+    }
+
+    window.saveApiKey = () => { window.saveApiKeyTop(); };
 
     window.llmAssist = async () => {
       const apiKey = localStorage.getItem('anthropic_api_key');
