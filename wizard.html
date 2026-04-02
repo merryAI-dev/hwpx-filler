@@ -104,7 +104,7 @@
         <button class="btn btn-outline" onclick="saveApiKeyTop()" style="padding:6px 14px;font-size:13px">저장</button>
         <span id="api-key-status" style="font-size:12px;color:#64748b"></span>
       </div>
-      <p style="font-size:11px;color:#94a3b8;margin-top:6px">LLM이 양식 구조를 분석하고 자동 매핑합니다. 키가 없으면 규칙 기반으로 동작합니다.</p>
+      <p style="font-size:11px;color:#94a3b8;margin-top:6px">키는 WASM 메모리에만 저장됩니다 — localStorage·서버 전송 없음. LLM에는 라벨 이름만 전달되며 개인정보(값)는 브라우저 밖으로 나가지 않습니다.</p>
     </div>
 
     <!-- Progress Bar -->
@@ -196,18 +196,23 @@
   </div>
 
   <script type="module">
-    import init, { analyzeForm, fillForm, extractData, extractCsv, mapToForm, formatForLLM } from './pkg/hwpx_filler.js';
+    import init, {
+      analyzeForm, fillForm, extractData, extractCsv, mapToForm, formatForLLM,
+      // Privacy-preserving exports (2세대)
+      setApiKey, clearApiKey, hasApiKey, callAnthropic,
+      extractLabelsOnly, applyLabelMappings,
+    } from './pkg/hwpx_filler.js';
 
     // ── State ──
     const S = {
-      sourceBytes: null,   // Uint8Array (소스 HWPX)
-      sourceText: null,    // string (소스 LLM 포맷)
-      sourceData: null,    // ExtractedField[] 또는 LLM 추출 결과
-      templateBytes: null, // Uint8Array
-      templateText: null,  // string (대상 LLM 포맷)
-      formFields: null,    // FieldInfo[]
-      mappingResult: null, // MappingResult
-      editedMappings: null,// MappingInfo[] (user-editable copy)
+      sourceBytes: null,    // Uint8Array (소스 HWPX) — 값 포함, WASM에만 전달
+      sourceData: null,     // ExtractedField[] — UI 표시용
+      templateBytes: null,  // Uint8Array
+      templateText: null,   // string (대상 라벨 구조) — LLM 전달용
+      formFields: null,     // FieldInfo[] — rules fallback용
+      editedMappings: null, // MappingInfo[] — UI 표시용
+      llmLabelPairs: null,  // [{sourceLabel, targetLabel}] — applyLabelMappings용
+      useLlmPath: false,    // true면 applyLabelMappings, false면 fillForm
     };
 
     // ── Init WASM ──
@@ -227,8 +232,7 @@
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
         S.sourceBytes = bytes;
-        S.sourceText = formatForLLM(bytes); // LLM용 테이블 포맷
-        // 규칙 기반 추출도 해둠 (fallback용)
+        // UI + rules fallback용 (값 포함)
         const result = extractData(bytes);
         S.sourceData = JSON.parse(result.json);
         document.getElementById('src-hwpx-box').classList.add('has-file');
@@ -268,8 +272,9 @@
       const file = input.files[0]; if (!file) return;
       try {
         S.templateBytes = new Uint8Array(await file.arrayBuffer());
-        S.templateText = formatForLLM(S.templateBytes); // LLM용 테이블 포맷
-        // 규칙 기반 분석도 해둠 (fallback용)
+        // 대상 양식 구조 (□ 위치 포함) — LLM에 전달할 라벨 구조
+        S.templateText = formatForLLM(S.templateBytes);
+        // rules fallback용
         const result = analyzeForm(S.templateBytes);
         S.formFields = JSON.parse(result.json);
         document.getElementById('tpl-box').classList.add('has-file');
@@ -287,68 +292,60 @@
 
     window.saveApiKeyTop = () => {
       const key = document.getElementById('api-key-top').value.trim();
-      if (key) {
-        localStorage.setItem('anthropic_api_key', key);
-        document.getElementById('api-key-status').textContent = '✓ 저장됨';
-        document.getElementById('api-key-status').style.color = '#16a34a';
-      }
+      if (!key) return;
+      // WASM 메모리에 저장 — JS 컨텍스트 외부, localStorage 미사용
+      setApiKey(key);
+      // 입력 필드 즉시 마스킹 (원본 값을 DOM에서 제거)
+      document.getElementById('api-key-top').value = '';
+      document.getElementById('api-key-status').textContent = '✓ WASM 메모리에 저장됨 (DOM·localStorage 미보관)';
+      document.getElementById('api-key-status').style.color = '#16a34a';
     };
-
-    // 페이지 로드 시 저장된 키 복원
-    {
-      const saved = localStorage.getItem('anthropic_api_key');
-      if (saved) {
-        document.getElementById('api-key-top').value = saved;
-        document.getElementById('api-key-status').textContent = '✓ 저장됨';
-        document.getElementById('api-key-status').style.color = '#16a34a';
-      }
-    }
 
     window.saveApiKey = () => { window.saveApiKeyTop(); };
 
+    // llmAssist: 미매핑 잔여 필드를 WASM callAnthropic으로 처리
+    // 소스 키(라벨명)만 전달 — 값은 포함 안 함
     window.llmAssist = async () => {
-      const apiKey = localStorage.getItem('anthropic_api_key');
-      if (!apiKey) { showStatus('llm-status', 'error', 'API 키를 먼저 입력하세요'); return; }
+      if (!hasApiKey()) { showStatus('llm-status', 'error', 'API 키를 먼저 입력하세요'); return; }
 
       const unmatched = S.editedMappings.filter(m => m.matchType === 'unmatched');
       if (unmatched.length === 0) { showStatus('llm-status', 'success', '미매핑 필드 없음'); return; }
 
-      const labels = unmatched.map(m => m.targetLabel);
-      const sourceKeys = S.sourceData.map(s => ({ key: s.key, label: s.rawLabel }));
+      // 라벨 이름만 전달 (값 없음)
+      const targetLabels = unmatched.map(m => m.targetLabel);
+      const sourceLabels = S.sourceData.map(s => s.rawLabel || s.key);
 
       showStatus('llm-status', 'info', `AI가 미매핑 ${unmatched.length}개 필드를 자동 매칭 중...`);
 
       try {
-        const resp = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-            'anthropic-dangerous-direct-browser-access': 'true',
-          },
-          body: JSON.stringify({
-            model: 'claude-haiku-4-5-20251001',
-            max_tokens: 1024,
-            messages: [{ role: 'user', content:
-              `Korean government form field mapper. Match unmatched form labels to data source keys.\n\nUnmatched labels: ${JSON.stringify(labels)}\nAvailable source keys: ${JSON.stringify(sourceKeys)}\n\nReturn JSON array only: [{"label":"...","suggestedKey":"...","confidence":0.9}]\nUse "none" if no match. JSON only, no explanation.`
-            }],
-          }),
+        const body = JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 1024,
+          messages: [{ role: 'user', content:
+            `한국 정부 양식 라벨 매핑. 미매핑 대상 라벨을 소스 라벨과 연결하세요.\n\n미매핑 대상 라벨: ${JSON.stringify(targetLabels)}\n소스 라벨 목록: ${JSON.stringify(sourceLabels)}\n\nJSON만 반환: [{"targetLabel":"...","sourceLabel":"..."}]\n매핑 불가 시 생략.`
+          }],
+          output_config: { format: { type: "json_schema", schema: {
+            type: "object",
+            properties: { pairs: { type: "array", items: {
+              type: "object",
+              properties: { targetLabel: { type: "string" }, sourceLabel: { type: "string" } },
+              required: ["targetLabel", "sourceLabel"], additionalProperties: false
+            }}},
+            required: ["pairs"], additionalProperties: false
+          }}}
         });
 
-        const data = await resp.json();
+        // API 키는 WASM 내부에서 주입 — JS는 키에 접근 불가
+        const responseText = await callAnthropic(body);
+        const data = JSON.parse(responseText);
         if (data.error) throw new Error(data.error.message);
 
-        const text = data.content[0].text;
-        const match = text.match(/\[[\s\S]*\]/);
-        if (!match) throw new Error('LLM 응답에서 JSON을 찾을 수 없음');
-
-        const suggestions = JSON.parse(match[0]);
+        const pairs = JSON.parse(data.content[0].text).pairs || [];
+        const norm = s => (s || '').replace(/\s/g, '').toLowerCase();
         let applied = 0;
-        for (const sug of suggestions) {
-          if (sug.suggestedKey === 'none') continue;
-          const mapping = S.editedMappings.find(m => m.targetLabel === sug.label && m.matchType === 'unmatched');
-          const source = S.sourceData.find(s => s.key === sug.suggestedKey);
+        for (const p of pairs) {
+          const mapping = S.editedMappings.find(m => norm(m.targetLabel) === norm(p.targetLabel) && m.matchType === 'unmatched');
+          const source = S.sourceData.find(s => norm(s.rawLabel || s.key) === norm(p.sourceLabel));
           if (mapping && source) {
             mapping.sourceKey = source.key;
             mapping.sourceValue = source.value;
@@ -378,23 +375,36 @@
 
     // ── Core logic ──
     async function computeMapping() {
-      const apiKey = localStorage.getItem('anthropic_api_key');
+      S.llmLabelPairs = null;
+      S.useLlmPath = false;
       let llmFullFailed = false;
 
-      if (apiKey && S.sourceText && S.templateText) {
-        // LLM-first: 테이블 구조를 LLM에 보여주고 매핑 판단을 맡김
-        showStatus('mapping-status', 'info', 'LLM이 매핑을 분석하고 있습니다...');
+      if (hasApiKey() && S.sourceBytes && S.templateText) {
+        showStatus('mapping-status', 'info', 'LLM이 라벨 구조를 분석하고 있습니다...');
         try {
-          const patches = await llmMapping(apiKey, S.sourceText, S.templateText);
-          S.editedMappings = patches.map(p => ({
-            sourceKey: p.label || '',
-            sourceValue: p.value || '',
-            targetLabel: p.targetLabel || p.label || '',
-            targetTableIndex: p.tableIndex ?? 0,
-            targetRow: p.row,
-            targetCol: p.col,
-            matchType: 'llm',
-          }));
+          // 소스: 라벨 이름만 추출 (값은 WASM 내부에 보관)
+          const srcLabels = JSON.parse(extractLabelsOnly(S.sourceBytes));
+          // 대상: □ 위치 포함 구조 (이미 formatForLLM으로 생성됨)
+          const pairs = await llmLabelMatch(srcLabels, S.templateText);
+
+          S.llmLabelPairs = pairs;
+          S.useLlmPath = true;
+
+          // UI 표시용: 라벨 쌍 → sourceData에서 값 조회 (로컬)
+          const norm = s => (s || '').replace(/\s/g, '').toLowerCase();
+          S.editedMappings = pairs.map(p => {
+            const src = S.sourceData?.find(s => norm(s.rawLabel || s.key) === norm(p.sourceLabel));
+            const tpl = S.formFields?.find(f => norm(f.label) === norm(p.targetLabel));
+            return {
+              sourceKey: src?.key || p.sourceLabel || '',
+              sourceValue: src?.value || '',
+              targetLabel: p.targetLabel || '',
+              targetTableIndex: tpl?.tableIndex ?? 0,
+              targetRow: tpl?.row ?? 0,
+              targetCol: tpl?.col ?? 0,
+              matchType: src?.value ? 'llm' : 'unmatched',
+            };
+          });
           renderMappingTable();
           return;
         } catch (e) {
@@ -406,118 +416,77 @@
 
       // Fallback: 규칙 기반 매핑
       const result = mapToForm(JSON.stringify(S.sourceData), JSON.stringify(S.formFields));
-      S.mappingResult = JSON.parse(result.json);
-      S.editedMappings = structuredClone(S.mappingResult.mappings);
+      S.editedMappings = structuredClone(JSON.parse(result.json).mappings);
       renderMappingTable();
 
-      // 미매핑 필드가 있고 API 키가 있으면 AI가 자동으로 한 번 더 매칭 시도
-      const unmatchedCount = S.editedMappings.filter(m => m.matchType === 'unmatched').length;
-      if (apiKey && !llmFullFailed && unmatchedCount > 0) {
-        await llmAssist();
+      // 미매핑 잔여 필드 → AI 자동 처리 (API 키 있고 LLM이 직전에 실패하지 않은 경우)
+      if (hasApiKey() && !llmFullFailed) {
+        const unmatchedCount = S.editedMappings.filter(m => m.matchType === 'unmatched').length;
+        if (unmatchedCount > 0) await llmAssist();
       }
     }
 
-    async function llmMapping(apiKey, sourceText, templateText) {
-      const prompt = `당신은 한국 정부 양식 데이터 매핑 전문가입니다.
-
-## 작업
-소스 문서의 데이터를 대상 양식의 빈 칸(□)에 매핑하세요.
+    // LLM에게 라벨 목록만 전달 → [{sourceLabel, targetLabel}] 쌍 반환
+    // 값(PII)과 좌표는 전달하지 않음 — WASM이 내부에서 처리
+    async function llmLabelMatch(srcLabels, templateText) {
+      const prompt = `한국 정부 양식 필드 매핑 전문가입니다.
+소스 라벨과 대상 양식 라벨을 의미적으로 매핑하세요.
 
 ## 규칙
-1. 소스에서 라벨-값 쌍을 파악: [라벨] 옆의 [값] → 라벨=값
-2. 대상 양식에서 같은 의미의 라벨 옆 □의 row, col 좌표에 값을 매핑
-3. 경력/사업 테이블: 소스의 데이터 행을 대상의 빈 행에 순서대로 대응
-4. 소스에 없는 데이터는 건너뛰기 (빈 값 넣지 말 것)
-5. 민감정보(주민등록번호, 여권번호) 제외
-6. □ 위치의 row와 col이 매핑 좌표
+- 같은 의미면 매핑 (예: "성명" ↔ "성 명", "직책" ↔ "직책/직위")
+- 소스에 없는 대상 라벨은 건너뜀
+- 값·좌표는 반환 금지 (시스템이 처리)
+- 민감정보 라벨(주민등록번호, 여권번호) 제외
 
-## 예시
+## 소스 라벨
+${JSON.stringify(srcLabels)}
 
-소스:
-Table 0 (2행 × 6열):
-  Row 0: [성 명] [김철수] [직 책] [대리] [생년] [1990.03.15]
-  Row 1: [E-mail] [kim@test.com] [휴대전화] [010-1111-2222]
-
-대상:
-Table 0 (2행 × 8열):
-  Row 0: [성 명] [□] [소 속] [□] [직책/직위] [□] [연 령] [□]
-  Row 1: [학 력] [□] [근무기간] [□]
-
-올바른 매핑:
-- "김철수" → 대상 Row 0, Col 1 (성 명 옆 □)
-- "대리" → 대상 Row 0, Col 5 (직책/직위 옆 □)
-- "1990.03.15" → 대상 Row 0, Col 7 (연 령 옆 □... 생년이므로)
-- "소 속"은 소스에 없으므로 건너뜀
-
-## 실제 데이터
-
-[소스 문서]
-${sourceText}
-
-[대상 양식]
+## 대상 양식 구조 (□ = 빈 칸)
 ${templateText}`;
 
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 8192,
-          messages: [{ role: 'user', content: prompt }],
-          output_config: {
-            format: {
-              type: "json_schema",
-              schema: {
-                type: "object",
-                properties: {
-                  mappings: {
-                    type: "array",
-                    items: {
-                      type: "object",
-                      properties: {
-                        row: { type: "integer", description: "대상 양식의 행 번호" },
-                        col: { type: "integer", description: "대상 양식의 열 번호" },
-                        value: { type: "string", description: "채울 값" },
-                        sourceLabel: { type: "string", description: "소스의 라벨명" },
-                        targetLabel: { type: "string", description: "대상의 라벨명" }
-                      },
-                      required: ["row", "col", "value", "targetLabel"],
-                      additionalProperties: false
-                    }
-                  }
-                },
-                required: ["mappings"],
-                additionalProperties: false
-              }
-            }
-          }
-        }),
+      const body = JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2048,
+        messages: [{ role: 'user', content: prompt }],
+        output_config: { format: { type: "json_schema", schema: {
+          type: "object",
+          properties: { label_pairs: { type: "array", items: {
+            type: "object",
+            properties: {
+              sourceLabel: { type: "string", description: "소스 라벨명" },
+              targetLabel: { type: "string", description: "대상 양식 라벨명" }
+            },
+            required: ["sourceLabel", "targetLabel"], additionalProperties: false
+          }}},
+          required: ["label_pairs"], additionalProperties: false
+        }}}
       });
 
-      const data = await resp.json();
+      // API 키는 WASM callAnthropic 내부에서 주입 — JS에 노출되지 않음
+      const responseText = await callAnthropic(body);
+      const data = JSON.parse(responseText);
       if (data.error) throw new Error(data.error.message);
-
-      // structured outputs → guaranteed valid JSON, regex 불필요
-      const result = JSON.parse(data.content[0].text);
-      return result.mappings;
+      return JSON.parse(data.content[0].text).label_pairs || [];
     }
 
     function executeAndDownload() {
-      const patches = S.editedMappings
-        .filter(m => m.matchType !== 'unmatched' && (m.sourceValue || m.value))
-        .map(m => ({
-          tableIndex: m.targetTableIndex ?? m.tableIndex ?? 0,
-          row: m.targetRow ?? m.row,
-          col: m.targetCol ?? m.col,
-          value: m.sourceValue || m.value || '',
-        }));
-
-      const output = fillForm(S.templateBytes, JSON.stringify(patches));
+      let output;
+      if (S.useLlmPath && S.sourceBytes && S.llmLabelPairs) {
+        // LLM 경로: 값 조회 + 좌표 계산 모두 WASM 내부에서 완결
+        // JS는 label_pairs만 전달 — 값도 좌표도 JS를 경유하지 않음
+        output = applyLabelMappings(S.sourceBytes, S.templateBytes, JSON.stringify(S.llmLabelPairs));
+      } else {
+        // Rules 경로: editedMappings의 값으로 fillForm
+        const patches = S.editedMappings
+          .filter(m => m.matchType !== 'unmatched' && (m.sourceValue || m.value))
+          .map(m => ({
+            tableIndex: m.targetTableIndex ?? m.tableIndex ?? 0,
+            row: m.targetRow ?? m.row,
+            col: m.targetCol ?? m.col,
+            value: m.sourceValue || m.value || '',
+          }));
+        output = fillForm(S.templateBytes, JSON.stringify(patches));
+      }
       const blob = new Blob([output], { type: 'application/octet-stream' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
