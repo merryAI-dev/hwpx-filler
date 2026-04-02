@@ -196,10 +196,13 @@ pub fn analyze_xml(xml: &str) -> Vec<TableInfo> {
                         table_depth -= 1;
                         if table_depth == 0 && in_table {
                             // Pass 2: borderFillIDRef 기반 label 보정
+                            // 보수적 기준: 이 fill style이 데이터 셀에 한 번도 나타나지 않을 때만 프로모션.
+                            // "label_count > data_count" 조건은 fill style을 공유하는 경우(서식3-5처럼
+                            // 모든 셀이 같은 스타일) 데이터 셀을 label로 잘못 분류한다.
                             let label_fills: std::collections::HashSet<String> = bf_label_count.iter()
-                                .filter(|(bf, count)| {
+                                .filter(|(bf, _count)| {
                                     let data = bf_data_count.get(*bf).unwrap_or(&0);
-                                    **count > *data
+                                    *data == 0   // 이 스타일이 데이터 셀에 전혀 없을 때만
                                 })
                                 .map(|(bf, _)| bf.clone())
                                 .collect();
@@ -465,6 +468,11 @@ fn is_korean_label(text: &str) -> bool {
         "참여임무", "참여기간", "사업참여기간", "참여율",
         "회사명", "근무기간", "담당업무", "비고", "발주처",
         "프로젝트", "상세경력", "사업명", "사업개요",
+        "투입기간", "기술분야", "관련기술", "담당임무", "전문분야",
+        // 이름/언어 구분
+        "국문", "영문",
+        // 인적사항 추가
+        "성별", "사업유형", "학위", "훈격",
         // 공문서 일반
         "신청인", "대표자", "담당자", "작성자", "확인자", "승인자",
         "일시", "날짜", "기간", "장소", "목적", "사유",

@@ -80,12 +80,14 @@ pub fn extract_data(xml: &str) -> Vec<ExtractedField> {
 
             let next_row = table.rows.get(row_idx + 1);
 
-            // 다음 행도 전부 label이면 연속 헤더이므로 건너뜀
-            let next_all_labels = next_row.map(|r| {
-                let non_empty: Vec<_> = r.cells.iter().filter(|c| !c.text.trim().is_empty()).collect();
-                !non_empty.is_empty() && non_empty.iter().all(|c| c.is_label)
-            }).unwrap_or(true);
-            if next_all_labels { continue; }
+            // 다음 행이 없거나 비어 있으면 건너뜀 (데이터 없음)
+            // 주의: "다음 행도 전부 label"인 경우를 연속 헤더로 건너뛰면
+            //   borderFillIDRef 오분류(서식3-5)로 인해 헤더 감지가 실패할 수 있으므로
+            //   이 체크는 제거한다.
+            let next_has_any = next_row.map(|r| {
+                r.cells.iter().any(|c| !c.text.trim().is_empty())
+            }).unwrap_or(false);
+            if !next_has_any { continue; }
 
             let header_cells: Vec<_> = row.cells.iter().collect();
 
