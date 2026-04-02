@@ -1,92 +1,45 @@
-//! 폼 채움 엔진
+//! 통합 폼 채움 API
+//!
+//! stream_analyzer + patcher + validate를 하나의 인터페이스로.
+//! main.rs와 wasm.rs 모두 이 모듈을 통해 접근.
 
-use crate::error::{FillerError, Result};
-use crate::model::{Section, Table, RunContent};
+use crate::error::Result;
+use crate::stream_analyzer::{FieldInfo, TableInfo};
 
-#[derive(Debug, Clone)]
-pub struct FillField {
-    pub table_index: usize,
-    pub row: u32,
-    pub col: u32,
-    pub value: String,
+/// 분석 결과
+pub struct AnalysisResult {
+    pub tables: Vec<TableInfo>,
+    pub fields: Vec<FieldInfo>,
 }
 
-#[derive(Debug, Clone)]
-pub struct DynamicRows {
-    pub table_index: usize,
-    pub template_row_addr: u32,
-    pub rows: Vec<Vec<String>>,
+/// HWPX section XML 분석 — 테이블 구조 + 필드 매핑
+pub fn analyze(xml: &str) -> AnalysisResult {
+    let tables = crate::stream_analyzer::analyze_xml(xml);
+    let fields = crate::stream_analyzer::extract_fields(&tables);
+    AnalysisResult { tables, fields }
 }
 
-pub fn collect_tables(section: &Section) -> Vec<&Table> {
-    section.paragraphs.iter()
-        .flat_map(|p| &p.runs)
-        .flat_map(|r| &r.contents)
-        .filter_map(|c| match c {
-            RunContent::Table(t) => Some(t.as_ref()),
-            _ => None,
-        })
-        .collect()
+/// 셀 텍스트 교체
+pub fn fill(
+    xml: &str,
+    patches: &[(usize, u32, u32, String)],
+) -> Result<String> {
+    crate::patcher::patch_cells(xml, patches)
 }
 
-pub fn collect_tables_mut(section: &mut Section) -> Vec<&mut Table> {
-    section.paragraphs.iter_mut()
-        .flat_map(|p| &mut p.runs)
-        .flat_map(|r| &mut r.contents)
-        .filter_map(|c| match c {
-            RunContent::Table(t) => Some(t.as_mut()),
-            _ => None,
-        })
-        .collect()
+/// 행 클론 + 셀 교체 (Phase C에서 구현)
+pub fn fill_with_rows(
+    xml: &str,
+    cell_patches: &[(usize, u32, u32, String)],
+    _row_clones: &[(usize, u32, usize)],
+) -> Result<String> {
+    // TODO Phase C: row_clones 처리 → patcher::patch_clone_rows
+    // 현재는 셀 교체만
+    crate::patcher::patch_cells(xml, cell_patches)
 }
 
-pub fn fill_fields(section: &mut Section, fields: &[FillField]) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let mut tables = collect_tables_mut(section);
-
-    for field in fields {
-        if field.table_index >= tables.len() {
-            warnings.push(format!("테이블 {} 없음", field.table_index));
-            continue;
-        }
-        match tables[field.table_index].get_cell_mut(field.row, field.col) {
-            Some(cell) => cell.set_text(&field.value),
-            None => warnings.push(format!(
-                "셀 ({}, {}) 없음 (테이블 {})", field.row, field.col, field.table_index
-            )),
-        }
-    }
-    Ok(warnings)
-}
-
-pub fn fill_dynamic_rows(section: &mut Section, dynamic: &DynamicRows) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let mut tables = collect_tables_mut(section);
-
-    if dynamic.table_index >= tables.len() {
-        return Err(FillerError::RowNotFound { table: dynamic.table_index, row: dynamic.template_row_addr });
-    }
-
-    let table = &mut tables[dynamic.table_index];
-    let template_idx = table.find_row(dynamic.template_row_addr)
-        .map(|(idx, _)| idx)
-        .ok_or(FillerError::RowNotFound { table: dynamic.table_index, row: dynamic.template_row_addr })?;
-
-    if dynamic.rows.len() > 1 {
-        table.clone_row(template_idx, dynamic.rows.len() - 1);
-    }
-
-    for (i, row_data) in dynamic.rows.iter().enumerate() {
-        let row_idx = template_idx + i;
-        if row_idx < table.rows.len() {
-            for (col_idx, value) in row_data.iter().enumerate() {
-                if col_idx < table.rows[row_idx].cells.len() {
-                    table.rows[row_idx].cells[col_idx].set_text(value);
-                } else {
-                    warnings.push(format!("행 {} 열 {} 초과", dynamic.template_row_addr + i as u32, col_idx));
-                }
-            }
-        }
-    }
-    Ok(warnings)
+/// 패치 후 구조 검증
+pub fn validate_patched(xml: &str) -> crate::validate::ValidationResult {
+    let tables = crate::stream_analyzer::analyze_xml(xml);
+    crate::validate::validate_stream(&tables)
 }

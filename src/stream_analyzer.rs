@@ -38,6 +38,7 @@ pub struct TableInfo {
 
 /// 분석된 필드 (label → data 매핑)
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FieldInfo {
     pub table_index: usize,
     pub row: u32,
