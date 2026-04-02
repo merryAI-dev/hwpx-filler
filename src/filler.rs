@@ -36,15 +36,20 @@ pub fn fill(
     crate::patcher::patch_cells(xml, patches)
 }
 
-/// 행 클론 + 셀 교체 (Phase C에서 구현)
+/// 행 클론 + 셀 교체
+/// 순서: 먼저 행 클론 (rowAddr 변경) → 그 다음 셀 교체 (새 주소 사용)
 pub fn fill_with_rows(
     xml: &str,
     cell_patches: &[(usize, u32, u32, String)],
-    _row_clones: &[(usize, u32, usize)],
+    row_clones: &[(usize, u32, usize)],
 ) -> Result<String> {
-    // TODO Phase C: row_clones 처리 → patcher::patch_clone_rows
-    // 현재는 셀 교체만
-    crate::patcher::patch_cells(xml, cell_patches)
+    let mut result = xml.to_string();
+    // 1. 행 클론 먼저 (rowAddr가 바뀜)
+    for (table_idx, row_addr, count) in row_clones {
+        result = crate::patcher::patch_clone_rows(&result, *table_idx, *row_addr, *count)?;
+    }
+    // 2. 셀 교체 (클론된 행의 새 주소로)
+    crate::patcher::patch_cells(&result, cell_patches)
 }
 
 /// 패치 후 구조 검증

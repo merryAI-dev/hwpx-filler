@@ -82,3 +82,40 @@ pub fn fill_form(
 
     Ok(output)
 }
+
+/// HWPX 행 클론 — 특정 테이블의 행을 N번 복제
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "cloneRows")]
+pub fn clone_rows(
+    hwpx_bytes: &[u8],
+    clones_json: &str,
+) -> Result<Vec<u8>, JsError> {
+    // clones_json: [{"tableIndex": 2, "templateRowAddr": 2, "count": 3}]
+    let clones: Vec<serde_json::Value> = serde_json::from_str(clones_json)
+        .map_err(|e| JsError::new(&format!("JSON parse error: {}", e)))?;
+
+    let text_files = crate::zipper::extract_text_files(hwpx_bytes)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+
+    let section0 = text_files.get("Contents/section0.xml")
+        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+
+    let clone_list: Vec<(usize, u32, usize)> = clones.iter().map(|c| {
+        (
+            c["tableIndex"].as_u64().unwrap_or(0) as usize,
+            c["templateRowAddr"].as_u64().unwrap_or(0) as u32,
+            c["count"].as_u64().unwrap_or(0) as usize,
+        )
+    }).collect();
+
+    let patched_xml = crate::patcher::patch_clone_rows_multi(section0, &clone_list)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+
+    let mut modified = std::collections::HashMap::new();
+    modified.insert("Contents/section0.xml".to_string(), patched_xml);
+
+    let output = crate::zipper::patch_hwpx(hwpx_bytes, &modified)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+
+    Ok(output)
+}
