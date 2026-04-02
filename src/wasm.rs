@@ -120,7 +120,19 @@ pub fn clone_rows(
     Ok(output)
 }
 
-// ── Wizard용 신규 exports ──
+// ── Wizard용 exports ──
+
+/// HWPX 테이블 구조를 LLM-friendly 텍스트로 포맷
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "formatForLLM")]
+pub fn format_for_llm_wasm(hwpx_bytes: &[u8]) -> Result<String, JsError> {
+    let text_files = crate::zipper::extract_text_files(hwpx_bytes)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let section0 = text_files.get("Contents/section0.xml")
+        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+    let tables = crate::stream_analyzer::analyze_xml(section0);
+    Ok(crate::llm_format::format_tables_for_llm(&tables))
+}
 
 /// HWPX 데이터 추출 — 채워진 양식에서 label:value 쌍 추출
 #[cfg(feature = "wasm")]

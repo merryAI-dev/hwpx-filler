@@ -162,9 +162,9 @@
       <p class="step-desc">자동 매핑 결과를 확인하고, 필요하면 수정하세요.</p>
       <div id="mapping-status"></div>
       <div id="mapping-table-wrap"></div>
-      <div class="llm-section" id="llm-section" style="display:none">
-        <h3>LLM Assist — 미매핑 필드 자동 제안</h3>
-        <p style="font-size:12px;color:#64748b;margin-bottom:8px">라벨 텍스트만 전송됩니다. 개인정보(이름, 전화번호 등)는 보내지 않습니다.</p>
+      <div class="llm-section" id="llm-section">
+        <h3>LLM 매핑 (API 키 필요)</h3>
+        <p style="font-size:12px;color:#64748b;margin-bottom:8px">테이블 구조만 전송됩니다. API 키가 있으면 LLM이 자동 매핑하고, 없으면 규칙 기반으로 동작합니다.</p>
         <div class="api-key-input">
           <input type="password" id="api-key" placeholder="Anthropic API Key" />
           <button class="btn btn-outline" onclick="saveApiKey()">저장</button>
@@ -192,12 +192,15 @@
   </div>
 
   <script type="module">
-    import init, { analyzeForm, fillForm, extractData, extractCsv, mapToForm } from './pkg/hwpx_filler.js';
+    import init, { analyzeForm, fillForm, extractData, extractCsv, mapToForm, formatForLLM } from './pkg/hwpx_filler.js';
 
     // ── State ──
     const S = {
-      sourceData: null,    // ExtractedField[]
+      sourceBytes: null,   // Uint8Array (소스 HWPX)
+      sourceText: null,    // string (소스 LLM 포맷)
+      sourceData: null,    // ExtractedField[] 또는 LLM 추출 결과
       templateBytes: null, // Uint8Array
+      templateText: null,  // string (대상 LLM 포맷)
       formFields: null,    // FieldInfo[]
       mappingResult: null, // MappingResult
       editedMappings: null,// MappingInfo[] (user-editable copy)
@@ -219,6 +222,9 @@
       const file = input.files[0]; if (!file) return;
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
+        S.sourceBytes = bytes;
+        S.sourceText = formatForLLM(bytes); // LLM용 테이블 포맷
+        // 규칙 기반 추출도 해둠 (fallback용)
         const result = extractData(bytes);
         S.sourceData = JSON.parse(result.json);
         document.getElementById('src-hwpx-box').classList.add('has-file');
@@ -258,6 +264,8 @@
       const file = input.files[0]; if (!file) return;
       try {
         S.templateBytes = new Uint8Array(await file.arrayBuffer());
+        S.templateText = formatForLLM(S.templateBytes); // LLM용 테이블 포맷
+        // 규칙 기반 분석도 해둠 (fallback용)
         const result = analyzeForm(S.templateBytes);
         S.formFields = JSON.parse(result.json);
         document.getElementById('tpl-box').classList.add('has-file');
@@ -265,12 +273,12 @@
       } catch (e) { showStatus('template-preview', 'error', `분석 실패: ${e.message || e}`); }
     };
 
-    window.goStep = (step) => {
-      if (step === 3 && S.sourceData && S.formFields) computeMapping();
-      if (step === 4) executeAndDownload();
+    window.goStep = async (step) => {
       document.querySelectorAll('.step').forEach(s => s.classList.remove('visible'));
       document.getElementById(`step${step}`).classList.add('visible');
       updateProgress(step);
+      if (step === 3 && (S.sourceData || S.sourceText) && S.templateBytes) await computeMapping();
+      if (step === 4) executeAndDownload();
     };
 
     window.saveApiKey = () => {
@@ -349,17 +357,99 @@
     };
 
     // ── Core logic ──
-    function computeMapping() {
+    async function computeMapping() {
+      const apiKey = localStorage.getItem('anthropic_api_key');
+
+      if (apiKey && S.sourceText && S.templateText) {
+        // LLM-first: 테이블 구조를 LLM에 보여주고 매핑 판단을 맡김
+        showStatus('mapping-status', 'info', 'LLM이 매핑을 분석하고 있습니다...');
+        try {
+          const patches = await llmMapping(apiKey, S.sourceText, S.templateText);
+          S.editedMappings = patches.map(p => ({
+            sourceKey: p.label || '',
+            sourceValue: p.value || '',
+            targetLabel: p.targetLabel || p.label || '',
+            targetTableIndex: p.tableIndex ?? 0,
+            targetRow: p.row,
+            targetCol: p.col,
+            matchType: 'llm',
+          }));
+          renderMappingTable();
+          return;
+        } catch (e) {
+          console.warn('LLM mapping failed, falling back to rules:', e);
+          showStatus('mapping-status', 'info', `LLM 실패 (${e.message}), 규칙 기반으로 전환...`);
+        }
+      }
+
+      // Fallback: 규칙 기반 매핑
       const result = mapToForm(JSON.stringify(S.sourceData), JSON.stringify(S.formFields));
       S.mappingResult = JSON.parse(result.json);
       S.editedMappings = structuredClone(S.mappingResult.mappings);
       renderMappingTable();
     }
 
+    async function llmMapping(apiKey, sourceText, templateText) {
+      const prompt = `당신은 한국 정부 양식 데이터 매핑 전문가입니다.
+
+아래에 "소스 문서"와 "대상 양식"의 테이블 구조가 있습니다.
+□는 빈 칸(데이터 입력 위치)입니다.
+
+소스 문서에서 데이터를 추출하고, 대상 양식의 빈 칸(□)에 어떤 값을 넣어야 하는지 매핑하세요.
+
+규칙:
+- 소스의 라벨-값 쌍을 파악하세요 (예: [성 명] 옆의 [해민영] → 성명=해민영)
+- 대상 양식에서 같은 의미의 라벨 옆 □에 값을 매핑하세요
+- 경력/사업 테이블은 행 순서대로 대응하세요
+- 매핑할 수 없는 필드는 건너뛰세요
+- 주민등록번호 같은 민감정보는 제외하세요
+
+[소스 문서]
+${sourceText}
+
+[대상 양식]
+${templateText}
+
+JSON 배열로만 응답하세요:
+[{"row": 0, "col": 1, "value": "해민영", "label": "성명", "targetLabel": "성 명"}, ...]
+
+row와 col은 대상 양식의 셀 좌표입니다.
+JSON만 반환하세요. 설명 없이.`;
+
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 4096,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message);
+
+      const text = data.content[0].text;
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) throw new Error('LLM 응답에서 JSON을 찾을 수 없음');
+
+      return JSON.parse(match[0]);
+    }
+
     function executeAndDownload() {
       const patches = S.editedMappings
-        .filter(m => m.matchType !== 'unmatched' && m.sourceValue)
-        .map(m => ({ tableIndex: m.targetTableIndex, row: m.targetRow, col: m.targetCol, value: m.sourceValue }));
+        .filter(m => m.matchType !== 'unmatched' && (m.sourceValue || m.value))
+        .map(m => ({
+          tableIndex: m.targetTableIndex ?? m.tableIndex ?? 0,
+          row: m.targetRow ?? m.row,
+          col: m.targetCol ?? m.col,
+          value: m.sourceValue || m.value || '',
+        }));
 
       const output = fillForm(S.templateBytes, JSON.stringify(patches));
       const blob = new Blob([output], { type: 'application/octet-stream' });

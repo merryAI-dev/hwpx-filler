@@ -434,18 +434,76 @@ fn attr_str(e: &quick_xml::events::BytesStart, key: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/// 라벨 셀 판별 — kordoc의 3단계 휴리스틱 채택
+///
+/// 1. 키워드 매칭 (한국 공문서 필드명)
+/// 2. 짧은 한글 텍스트 (2-8자, 숫자 없음, 괄호/콜론 허용)
+/// 3. "라벨:" 또는 "라벨 :" 패턴
+///
+/// 참고: kordoc (https://github.com/chrisryugj/kordoc) src/form/recognize.ts
 fn is_korean_label(text: &str) -> bool {
-    let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if t.is_empty() { return false; }
-    let patterns = [
-        "성명", "이름", "직책", "직위", "생년", "이메일", "E-mail",
-        "휴대전화", "전화", "연락처", "경력", "유사경력", "자격증",
+    let trimmed = text.trim();
+    if trimmed.is_empty() { return false; }
+
+    // 공백 제거 버전 (키워드 매칭용)
+    let normalized: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    let char_count = normalized.chars().count();
+
+    // 너무 긴 텍스트는 라벨이 아님 (데이터 설명이나 본문)
+    if char_count > 20 { return false; }
+
+    // 1. 키워드 매칭 — 한국 공문서에서 흔한 필드명
+    // kordoc 키워드 + 우리 기존 키워드 병합
+    let keywords = [
+        // 인적사항
+        "성명", "이름", "소속", "직책", "직위", "직급", "부서",
+        "생년", "생년월일", "주민등록번호", "연령",
+        "이메일", "E-mail", "전화", "휴대전화", "연락처", "팩스",
+        "주소", "학력", "전공", "학교",
+        // 사업/경력
+        "경력", "유사경력", "자격증", "근무경력",
         "참여임무", "참여기간", "사업참여기간", "참여율",
         "회사명", "근무기간", "담당업무", "비고", "발주처",
-        "프로젝트", "상세경력", "상주근무", "기간", "직급",
-        "소속", "부서", "학력", "전공", "주소",
+        "프로젝트", "상세경력", "사업명", "사업개요",
+        // 공문서 일반
+        "신청인", "대표자", "담당자", "작성자", "확인자", "승인자",
+        "일시", "날짜", "기간", "장소", "목적", "사유",
+        "금액", "수량", "단가", "합계",
     ];
-    patterns.iter().any(|p| t.contains(p))
+    if keywords.iter().any(|kw| normalized.contains(kw)) {
+        return true;
+    }
+
+    // 2. 짧은 한글 텍스트 — 보수적 적용
+    // 원본 텍스트(공백 포함)에서 판단해서 "성 명" (공백 있는 라벨) 감지
+    // 단, 사람 이름(2-3자 한글)이나 직위("사업총괄") 같은 데이터와 구분하기 위해:
+    //   - 공백으로 분리된 한자어 패턴 ("성 명", "직 책", "학 력") → label
+    //   - 순수 한글 2-3자 ("해민영", "팀장") → 이름/직위일 수 있으므로 비허용
+    //   - 4자 이상 순수 한글 ("사업총괄", "벤처전문위원") → 데이터일 수 있으므로 비허용
+    // 결론: 규칙 2는 "공백으로 분리된 한자어 라벨"에만 적용
+    let original_trimmed = text.trim();
+    let words: Vec<&str> = original_trimmed.split_whitespace().collect();
+    if words.len() >= 2 && words.len() <= 4 {
+        // "성 명", "직 책", "학 력", "비 고" — 각 단어가 1-4자 한글
+        let all_short_korean = words.iter().all(|w| {
+            let wlen = w.chars().count();
+            wlen >= 1 && wlen <= 4 && w.chars().all(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c))
+        });
+        let no_digits = !original_trimmed.chars().any(|c| c.is_ascii_digit());
+        if all_short_korean && no_digits {
+            return true;
+        }
+    }
+
+    // 3. "라벨:" 또는 "라벨 :" 패턴
+    if normalized.ends_with(':') || normalized.ends_with('：') {
+        let without_colon: String = normalized.chars().take(char_count - 1).collect();
+        if without_colon.chars().count() >= 2 {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn infer_canonical_key(label: &str) -> &'static str {

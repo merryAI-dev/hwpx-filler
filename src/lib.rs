@@ -18,6 +18,7 @@ pub mod model;
 pub mod parser;
 pub mod filler;
 pub mod extractor;
+pub mod llm_format;
 pub mod zipper;
 pub mod patcher;
 pub mod stream_analyzer;
