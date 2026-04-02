@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HWPX Form Filler Wizard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8fafc; color: #1e293b; }
+    .container { max-width: 860px; margin: 0 auto; padding: 24px 16px; }
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+    .subtitle { color: #64748b; font-size: 13px; margin-bottom: 24px; }
+
+    /* Progress */
+    .progress { display: flex; justify-content: center; gap: 0; margin-bottom: 32px; }
+    .progress-step { display: flex; align-items: center; }
+    .progress-circle { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; border: 2px solid #cbd5e1; color: #94a3b8; background: #fff; }
+    .progress-circle.active { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
+    .progress-circle.done { border-color: #16a34a; color: #fff; background: #16a34a; }
+    .progress-line { width: 48px; height: 2px; background: #cbd5e1; margin: 0 4px; }
+    .progress-line.done { background: #16a34a; }
+    .progress-label { font-size: 11px; color: #94a3b8; text-align: center; margin-top: 4px; }
+    .progress-label.active { color: #2563eb; font-weight: 600; }
+
+    /* Step cards */
+    .step { display: none; background: #fff; border-radius: 12px; padding: 28px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .step.visible { display: block; }
+    .step h2 { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
+    .step-desc { color: #64748b; font-size: 13px; margin-bottom: 20px; }
+
+    /* Tabs */
+    .tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid #e2e8f0; }
+    .tab { padding: 8px 16px; font-size: 13px; cursor: pointer; border-bottom: 2px solid transparent; color: #64748b; }
+    .tab.active { color: #2563eb; border-bottom-color: #2563eb; font-weight: 600; }
+
+    /* File upload */
+    .upload-box { border: 2px dashed #d1d5db; border-radius: 10px; padding: 24px; text-align: center; cursor: pointer; background: #fafafa; margin-bottom: 12px; }
+    .upload-box:hover { border-color: #93c5fd; background: #eff6ff; }
+    .upload-box.has-file { border-color: #86efac; background: #f0fdf4; }
+    .upload-box input { display: none; }
+    .upload-label { font-weight: 600; font-size: 14px; }
+    .upload-hint { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+
+    /* Tables */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 12px 0; }
+    th { background: #f1f5f9; padding: 8px 10px; text-align: left; font-weight: 600; font-size: 12px; color: #475569; }
+    td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }
+    tr.match-canonical { background: #f0fdf4; }
+    tr.match-normalized { background: #f0fdf4; }
+    tr.match-fuzzy { background: #fefce8; }
+    tr.match-unmatched { background: #fef2f2; }
+
+    /* Badges */
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-green { background: #dcfce7; color: #166534; }
+    .badge-yellow { background: #fef9c3; color: #854d0e; }
+    .badge-red { background: #fee2e2; color: #991b1b; }
+    .badge-blue { background: #dbeafe; color: #1e40af; }
+
+    /* Buttons */
+    .btn { padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:disabled { background: #cbd5e1; cursor: default; }
+    .btn-secondary { background: #f1f5f9; color: #475569; }
+    .btn-success { background: #16a34a; color: #fff; }
+    .btn-success:hover { background: #15803d; }
+    .btn-outline { background: transparent; border: 1px solid #d1d5db; color: #475569; }
+    .btn-row { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
+
+    /* Select */
+    select { padding: 4px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; width: 100%; }
+
+    /* Status */
+    .status { padding: 10px 14px; border-radius: 8px; font-size: 13px; margin: 12px 0; }
+    .status-info { background: #dbeafe; color: #1e40af; }
+    .status-success { background: #dcfce7; color: #166534; }
+    .status-error { background: #fee2e2; color: #991b1b; }
+
+    /* LLM */
+    .llm-section { margin-top: 16px; padding: 16px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
+    .llm-section h3 { font-size: 14px; margin-bottom: 8px; }
+    .api-key-input { display: flex; gap: 8px; margin-bottom: 8px; }
+    .api-key-input input { flex: 1; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+
+    /* JSON textarea */
+    textarea { width: 100%; min-height: 120px; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; font-family: monospace; font-size: 13px; resize: vertical; }
+
+    /* Done */
+    .done-card { text-align: center; padding: 40px 20px; }
+    .done-icon { font-size: 48px; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>HWPX 양식 자동 채움</h1>
+    <p class="subtitle">모든 처리는 브라우저에서 실행됩니다. 개인정보가 서버로 전송되지 않습니다.</p>
+
+    <!-- Progress Bar -->
+    <div class="progress">
+      <div class="progress-step"><div class="progress-circle active" id="pc1">1</div></div>
+      <div class="progress-line" id="pl1"></div>
+      <div class="progress-step"><div class="progress-circle" id="pc2">2</div></div>
+      <div class="progress-line" id="pl2"></div>
+      <div class="progress-step"><div class="progress-circle" id="pc3">3</div></div>
+      <div class="progress-line" id="pl3"></div>
+      <div class="progress-step"><div class="progress-circle" id="pc4">4</div></div>
+    </div>
+
+    <!-- Step 1: Data Source -->
+    <div class="step visible" id="step1">
+      <h2>1. 데이터 소스</h2>
+      <p class="step-desc">채울 데이터가 있는 파일을 업로드하세요.</p>
+      <div class="tabs">
+        <div class="tab active" onclick="switchTab('hwpx')">HWPX 파일</div>
+        <div class="tab" onclick="switchTab('csv')">CSV 파일</div>
+        <div class="tab" onclick="switchTab('json')">JSON 직접 입력</div>
+      </div>
+      <div id="tab-hwpx">
+        <label class="upload-box" id="src-hwpx-box">
+          <div class="upload-label">HWPX 파일 선택</div>
+          <div class="upload-hint">기존에 작성된 양식에서 데이터를 추출합니다</div>
+          <input type="file" accept=".hwpx" onchange="handleSourceHwpx(this)">
+        </label>
+      </div>
+      <div id="tab-csv" style="display:none">
+        <label class="upload-box" id="src-csv-box">
+          <div class="upload-label">CSV 파일 선택</div>
+          <div class="upload-hint">Firebase export, Google Sheets export 등</div>
+          <input type="file" accept=".csv" onchange="handleSourceCsv(this)">
+        </label>
+      </div>
+      <div id="tab-json" style="display:none">
+        <textarea id="json-input" placeholder='[{"key": "name", "value": "김보람"}, {"key": "email", "value": "boram@mysc.co.kr"}]'></textarea>
+        <button class="btn btn-primary" onclick="handleSourceJson()" style="margin-top:8px">JSON 확인</button>
+      </div>
+      <div id="source-preview"></div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btn-step1-next" disabled onclick="goStep(2)">다음</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Form Template -->
+    <div class="step" id="step2">
+      <h2>2. 서식 템플릿</h2>
+      <p class="step-desc">데이터를 채워넣을 빈 양식을 업로드하세요.</p>
+      <label class="upload-box" id="tpl-box">
+        <div class="upload-label">HWPX 양식 파일 선택</div>
+        <div class="upload-hint">서식5, 서식6 등 정부 양식</div>
+        <input type="file" accept=".hwpx" onchange="handleTemplate(this)">
+      </label>
+      <div id="template-preview"></div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goStep(1)">이전</button>
+        <button class="btn btn-primary" id="btn-step2-next" disabled onclick="goStep(3)">다음</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Mapping Preview -->
+    <div class="step" id="step3">
+      <h2>3. 매핑 확인</h2>
+      <p class="step-desc">자동 매핑 결과를 확인하고, 필요하면 수정하세요.</p>
+      <div id="mapping-status"></div>
+      <div id="mapping-table-wrap"></div>
+      <div class="llm-section" id="llm-section" style="display:none">
+        <h3>LLM Assist — 미매핑 필드 자동 제안</h3>
+        <p style="font-size:12px;color:#64748b;margin-bottom:8px">라벨 텍스트만 전송됩니다. 개인정보(이름, 전화번호 등)는 보내지 않습니다.</p>
+        <div class="api-key-input">
+          <input type="password" id="api-key" placeholder="Anthropic API Key" />
+          <button class="btn btn-outline" onclick="saveApiKey()">저장</button>
+        </div>
+        <button class="btn btn-primary" onclick="llmAssist()">LLM Assist 실행</button>
+        <div id="llm-status"></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goStep(2)">이전</button>
+        <button class="btn btn-success" id="btn-step3-next" onclick="goStep(4)">확인 및 채우기</button>
+      </div>
+    </div>
+
+    <!-- Step 4: Download -->
+    <div class="step" id="step4">
+      <h2>4. 완료</h2>
+      <div class="done-card">
+        <div class="done-icon">&#10003;</div>
+        <div id="done-summary"></div>
+        <div class="btn-row" style="justify-content:center;margin-top:24px">
+          <button class="btn btn-secondary" onclick="goStep(1)">새로 시작</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import init, { analyzeForm, fillForm, extractData, extractCsv, mapToForm } from './pkg/hwpx_filler.js';
+
+    // ── State ──
+    const S = {
+      sourceData: null,    // ExtractedField[]
+      templateBytes: null, // Uint8Array
+      formFields: null,    // FieldInfo[]
+      mappingResult: null, // MappingResult
+      editedMappings: null,// MappingInfo[] (user-editable copy)
+    };
+
+    // ── Init WASM ──
+    await init();
+
+    // ── Expose to onclick ──
+    window.switchTab = (tab) => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelector(`.tab[onclick*="${tab}"]`).classList.add('active');
+      ['hwpx','csv','json'].forEach(t => {
+        document.getElementById(`tab-${t}`).style.display = t === tab ? 'block' : 'none';
+      });
+    };
+
+    window.handleSourceHwpx = async (input) => {
+      const file = input.files[0]; if (!file) return;
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const result = extractData(bytes);
+        S.sourceData = JSON.parse(result.json);
+        document.getElementById('src-hwpx-box').classList.add('has-file');
+        renderSourcePreview();
+      } catch (e) { showStatus('source-preview', 'error', `추출 실패: ${e.message || e}`); }
+    };
+
+    window.handleSourceCsv = async (input) => {
+      const file = input.files[0]; if (!file) return;
+      try {
+        let text = await file.text();
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+        const result = extractCsv(text);
+        S.sourceData = JSON.parse(result.json);
+        document.getElementById('src-csv-box').classList.add('has-file');
+        renderSourcePreview();
+      } catch (e) { showStatus('source-preview', 'error', `CSV 파싱 실패: ${e.message || e}`); }
+    };
+
+    window.handleSourceJson = () => {
+      try {
+        const text = document.getElementById('json-input').value;
+        const parsed = JSON.parse(text);
+        const arr = Array.isArray(parsed) ? parsed : Object.entries(parsed).map(([k,v]) => ({key:k, value:String(v)}));
+        S.sourceData = arr.map((item, i) => ({
+          rawLabel: item.key || item.label || '',
+          normalizedLabel: (item.key || item.label || '').replace(/\s/g, ''),
+          key: item.key || item.label || '',
+          value: item.value || '',
+          tableIndex: 0, row: 0, col: i,
+        }));
+        renderSourcePreview();
+      } catch (e) { showStatus('source-preview', 'error', `JSON 파싱 실패: ${e.message}`); }
+    };
+
+    window.handleTemplate = async (input) => {
+      const file = input.files[0]; if (!file) return;
+      try {
+        S.templateBytes = new Uint8Array(await file.arrayBuffer());
+        const result = analyzeForm(S.templateBytes);
+        S.formFields = JSON.parse(result.json);
+        document.getElementById('tpl-box').classList.add('has-file');
+        renderTemplatePreview();
+      } catch (e) { showStatus('template-preview', 'error', `분석 실패: ${e.message || e}`); }
+    };
+
+    window.goStep = (step) => {
+      if (step === 3 && S.sourceData && S.formFields) computeMapping();
+      if (step === 4) executeAndDownload();
+      document.querySelectorAll('.step').forEach(s => s.classList.remove('visible'));
+      document.getElementById(`step${step}`).classList.add('visible');
+      updateProgress(step);
+    };
+
+    window.saveApiKey = () => {
+      const key = document.getElementById('api-key').value.trim();
+      if (key) { localStorage.setItem('anthropic_api_key', key); showStatus('llm-status', 'success', 'API 키 저장됨'); }
+    };
+
+    window.llmAssist = async () => {
+      const apiKey = localStorage.getItem('anthropic_api_key');
+      if (!apiKey) { showStatus('llm-status', 'error', 'API 키를 먼저 입력하세요'); return; }
+
+      const unmatched = S.editedMappings.filter(m => m.matchType === 'unmatched');
+      if (unmatched.length === 0) { showStatus('llm-status', 'success', '미매핑 필드 없음'); return; }
+
+      const labels = unmatched.map(m => m.targetLabel);
+      const sourceKeys = S.sourceData.map(s => ({ key: s.key, label: s.rawLabel }));
+
+      showStatus('llm-status', 'info', 'LLM에 문의 중...');
+
+      try {
+        const resp = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true',
+          },
+          body: JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 1024,
+            messages: [{ role: 'user', content:
+              `Korean government form field mapper. Match unmatched form labels to data source keys.\n\nUnmatched labels: ${JSON.stringify(labels)}\nAvailable source keys: ${JSON.stringify(sourceKeys)}\n\nReturn JSON array only: [{"label":"...","suggestedKey":"...","confidence":0.9}]\nUse "none" if no match. JSON only, no explanation.`
+            }],
+          }),
+        });
+
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error.message);
+
+        const text = data.content[0].text;
+        const match = text.match(/\[[\s\S]*\]/);
+        if (!match) throw new Error('LLM 응답에서 JSON을 찾을 수 없음');
+
+        const suggestions = JSON.parse(match[0]);
+        let applied = 0;
+        for (const sug of suggestions) {
+          if (sug.suggestedKey === 'none') continue;
+          const mapping = S.editedMappings.find(m => m.targetLabel === sug.label && m.matchType === 'unmatched');
+          const source = S.sourceData.find(s => s.key === sug.suggestedKey);
+          if (mapping && source) {
+            mapping.sourceKey = source.key;
+            mapping.sourceValue = source.value;
+            mapping.matchType = 'llm';
+            applied++;
+          }
+        }
+        renderMappingTable();
+        showStatus('llm-status', 'success', `${applied}개 필드 자동 매핑됨`);
+      } catch (e) {
+        showStatus('llm-status', 'error', `LLM 오류: ${e.message}`);
+      }
+    };
+
+    window.onMappingChange = (idx, sourceKey) => {
+      const m = S.editedMappings[idx];
+      if (!sourceKey) {
+        m.sourceKey = ''; m.sourceValue = ''; m.matchType = 'unmatched';
+      } else {
+        const src = S.sourceData.find(s => s.key === sourceKey);
+        m.sourceKey = src?.key || sourceKey;
+        m.sourceValue = src?.value || '';
+        m.matchType = 'manual';
+      }
+      renderMappingTable();
+    };
+
+    // ── Core logic ──
+    function computeMapping() {
+      const result = mapToForm(JSON.stringify(S.sourceData), JSON.stringify(S.formFields));
+      S.mappingResult = JSON.parse(result.json);
+      S.editedMappings = structuredClone(S.mappingResult.mappings);
+      renderMappingTable();
+    }
+
+    function executeAndDownload() {
+      const patches = S.editedMappings
+        .filter(m => m.matchType !== 'unmatched' && m.sourceValue)
+        .map(m => ({ tableIndex: m.targetTableIndex, row: m.targetRow, col: m.targetCol, value: m.sourceValue }));
+
+      const output = fillForm(S.templateBytes, JSON.stringify(patches));
+      const blob = new Blob([output], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `filled_${new Date().toISOString().slice(0,10)}.hwpx`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      const filled = patches.length;
+      const skipped = S.editedMappings.length - filled;
+      document.getElementById('done-summary').innerHTML =
+        `<p style="font-size:18px;font-weight:600;margin-bottom:8px">${filled}개 필드 채움 완료</p>` +
+        `<p style="color:#64748b">${skipped > 0 ? skipped + '개 필드 미매핑 (건너뜀)' : '모든 필드 매핑됨'}</p>`;
+    }
+
+    // ── Render ──
+    function renderSourcePreview() {
+      if (!S.sourceData?.length) return;
+      let html = `<div class="status status-success">${S.sourceData.length}개 필드 추출됨</div>`;
+      html += '<table><thead><tr><th>키</th><th>값</th></tr></thead><tbody>';
+      for (const f of S.sourceData) {
+        const val = f.value.length > 40 ? f.value.slice(0,40) + '...' : f.value;
+        html += `<tr><td><code>${esc(f.key)}</code></td><td>${esc(val)}</td></tr>`;
+      }
+      html += '</tbody></table>';
+      document.getElementById('source-preview').innerHTML = html;
+      document.getElementById('btn-step1-next').disabled = false;
+    }
+
+    function renderTemplatePreview() {
+      if (!S.formFields?.length) return;
+      let html = `<div class="status status-success">${S.formFields.length}개 필드 감지됨</div>`;
+      html += '<table><thead><tr><th>라벨</th><th>매핑 키</th><th>정확도</th></tr></thead><tbody>';
+      for (const f of S.formFields) {
+        const conf = f.confidence > 0.8 ? 'badge-green' : 'badge-yellow';
+        html += `<tr><td>${esc(f.label)}</td><td><code>${esc(f.canonicalKey)}</code></td><td><span class="badge ${conf}">${Math.round(f.confidence*100)}%</span></td></tr>`;
+      }
+      html += '</tbody></table>';
+      document.getElementById('template-preview').innerHTML = html;
+      document.getElementById('btn-step2-next').disabled = false;
+    }
+
+    function renderMappingTable() {
+      const m = S.editedMappings;
+      const unmatched = m.filter(x => x.matchType === 'unmatched').length;
+
+      let statusHtml = '';
+      const matched = m.length - unmatched;
+      if (unmatched > 0) {
+        statusHtml = `<div class="status status-info">${matched}/${m.length} 자동 매핑 · <strong>${unmatched}개 미매핑</strong> — 아래에서 수동 선택하거나 LLM Assist를 사용하세요</div>`;
+      } else {
+        statusHtml = `<div class="status status-success">${m.length}/${m.length} 전부 매핑됨</div>`;
+      }
+      document.getElementById('mapping-status').innerHTML = statusHtml;
+
+      let html = '<table><thead><tr><th>양식 필드</th><th>데이터 소스</th><th>값 미리보기</th><th>상태</th></tr></thead><tbody>';
+      m.forEach((row, i) => {
+        const cls = `match-${row.matchType}`;
+        const badgeCls = { canonical: 'badge-green', normalized: 'badge-green', fuzzy: 'badge-yellow', manual: 'badge-blue', llm: 'badge-blue', unmatched: 'badge-red' }[row.matchType] || 'badge-red';
+        const badgeText = { canonical: '자동', normalized: '자동', fuzzy: '유사', manual: '수동', llm: 'LLM', unmatched: '미매핑' }[row.matchType] || '?';
+
+        let options = '<option value="">— 선택 —</option>';
+        for (const s of S.sourceData) {
+          const sel = s.key === row.sourceKey ? 'selected' : '';
+          options += `<option value="${esc(s.key)}" ${sel}>${esc(s.key)} (${esc(s.value.slice(0,20))})</option>`;
+        }
+
+        html += `<tr class="${cls}">`;
+        html += `<td>${esc(row.targetLabel)}</td>`;
+        html += `<td><select onchange="onMappingChange(${i}, this.value)">${options}</select></td>`;
+        html += `<td style="color:#64748b;font-size:12px">${esc(row.sourceValue?.slice(0,30) || '')}</td>`;
+        html += `<td><span class="badge ${badgeCls}">${badgeText}</span></td>`;
+        html += '</tr>';
+      });
+      html += '</tbody></table>';
+      document.getElementById('mapping-table-wrap').innerHTML = html;
+
+      // LLM section visibility
+      document.getElementById('llm-section').style.display = unmatched > 0 ? 'block' : 'none';
+
+      // Restore saved API key
+      const saved = localStorage.getItem('anthropic_api_key');
+      if (saved) document.getElementById('api-key').value = saved;
+    }
+
+    function updateProgress(step) {
+      for (let i = 1; i <= 4; i++) {
+        const circle = document.getElementById(`pc${i}`);
+        circle.className = 'progress-circle' + (i < step ? ' done' : i === step ? ' active' : '');
+        circle.textContent = i < step ? '✓' : i;
+      }
+      for (let i = 1; i <= 3; i++) {
+        document.getElementById(`pl${i}`).className = 'progress-line' + (i < step ? ' done' : '');
+      }
+    }
+
+    function showStatus(containerId, type, msg) {
+      document.getElementById(containerId).innerHTML = `<div class="status status-${type}">${esc(msg)}</div>`;
+    }
+
+    function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  </script>
+</body>
+</html>
