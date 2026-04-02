@@ -29,30 +29,42 @@ pub fn patch_cell_text(
     let target = find_cell_text_position(xml, table_index, row_addr, col_addr)?;
 
     match target {
-        Some((text_start, text_end)) => {
-            // Pass 2: 문자열 치환
-            let mut result = String::with_capacity(xml.len());
+        Some(CellTextTarget::ReplaceText(text_start, text_end)) => {
+            // 기존 텍스트 교체 (또는 빈 <hp:t></hp:t>에 삽입)
+            let mut result = String::with_capacity(xml.len() + new_text.len());
             result.push_str(&xml[..text_start]);
             result.push_str(&escape_xml(new_text));
             result.push_str(&xml[text_end..]);
             Ok(result)
         }
-        None => Ok(xml.to_string()), // 대상 셀 못 찾음
+        Some(CellTextTarget::InsertIntoEmptyRun(slash_pos)) => {
+            // <hp:run charPrIDRef="X"/> → <hp:run charPrIDRef="X"><hp:t>TEXT</hp:t></hp:run>
+            // slash_pos는 "/" 위치, 그 다음이 ">"
+            let mut result = String::with_capacity(xml.len() + new_text.len() + 30);
+            result.push_str(&xml[..slash_pos]); // <hp:run charPrIDRef="X" 까지
+            result.push_str(&format!("><hp:t>{}</hp:t></hp:run>", escape_xml(new_text)));
+            result.push_str(&xml[slash_pos + 2..]); // "/>" 이후
+            Ok(result)
+        }
+        None => Ok(xml.to_string()),
     }
 }
 
-/// 셀 내 첫 번째 <hp:t>TEXT</hp:t>의 TEXT 바이트 범위 찾기
-///
-/// HWPX 셀 구조: <hp:tc> → <hp:subList> → <hp:p> → <hp:run> → <hp:t>TEXT</hp:t>
-///              → ... → <hp:cellAddr rowAddr="R" colAddr="C"/> → ...
-/// 주의: <hp:t>가 <hp:cellAddr>보다 먼저 나옴!
-/// 그래서 셀 전체를 스캔해서 cellAddr를 확인한 후, 해당 셀의 <hp:t> 텍스트 위치를 반환.
+/// 셀 텍스트 위치 결과
+enum CellTextTarget {
+    /// 기존 텍스트 교체: (text_start, text_end) 범위
+    ReplaceText(usize, usize),
+    /// 빈 셀 삽입: self-closing <hp:run .../> 의 /> 위치
+    InsertIntoEmptyRun(usize),
+}
+
+/// 셀 내 텍스트 위치 또는 빈 run 위치 찾기
 fn find_cell_text_position(
     xml: &str,
     table_index: usize,
     row_addr: u32,
     col_addr: u32,
-) -> Result<Option<(usize, usize)>> {
+) -> Result<Option<CellTextTarget>> {
     let mut reader = Reader::from_str(xml);
 
     let mut current_table = 0usize;
@@ -61,7 +73,8 @@ fn find_cell_text_position(
 
     // 셀 단위 상태
     let mut in_cell = false;
-    let mut cell_t_positions: Vec<(usize, usize)> = Vec::new(); // 이 셀 안의 <t> 텍스트 위치들
+    let mut cell_t_positions: Vec<(usize, usize)> = Vec::new();
+    let mut cell_empty_run_pos: Option<usize> = None; // self-closing <hp:run .../> 의 /> 직전 위치
     let mut cell_row_addr: Option<u32> = None;
     let mut cell_col_addr: Option<u32> = None;
 
@@ -83,6 +96,7 @@ fn find_cell_text_position(
                     "tc" if in_target_table => {
                         in_cell = true;
                         cell_t_positions.clear();
+                        cell_empty_run_pos = None;
                         cell_row_addr = None;
                         cell_col_addr = None;
                     }
@@ -116,13 +130,20 @@ fn find_cell_text_position(
                         // 셀 종료 — cellAddr 확인 후 매칭되면 반환
                         in_cell = false;
                         if cell_row_addr == Some(row_addr) && cell_col_addr == Some(col_addr) {
-                            // 매칭! 첫 번째 <hp:t>의 텍스트 위치 반환
+                            // Case 1: 텍스트가 있는 셀 → 교체
                             if let Some(&(start, end)) = cell_t_positions.first() {
-                                if start != end { // 텍스트가 있는 경우
-                                    return Ok(Some((start, end)));
+                                if start != end {
+                                    return Ok(Some(CellTextTarget::ReplaceText(start, end)));
                                 }
                             }
-                            // 텍스트가 없는 셀 — 현재는 교체 불가
+                            // Case 2: <hp:t></hp:t> (빈 텍스트) → 삽입 위치 = start
+                            if let Some(&(start, _)) = cell_t_positions.first() {
+                                return Ok(Some(CellTextTarget::ReplaceText(start, start)));
+                            }
+                            // Case 3: self-closing <hp:run/> → 확장 삽입
+                            if let Some(pos) = cell_empty_run_pos {
+                                return Ok(Some(CellTextTarget::InsertIntoEmptyRun(pos)));
+                            }
                             return Ok(None);
                         }
                     }
@@ -138,6 +159,17 @@ fn find_cell_text_position(
             Ok(Event::Empty(ref e)) => {
                 let local = e.local_name();
                 let name = std::str::from_utf8(local.as_ref()).unwrap_or("");
+
+                // self-closing <hp:run charPrIDRef="X"/> — 빈 셀
+                if name == "run" && in_cell && cell_empty_run_pos.is_none() {
+                    // /> 직전 위치 = reader.buffer_position() - 2 ("/>")
+                    // 실제로는 원본 XML에서 이 태그의 위치를 찾아야 함
+                    let pos = reader.buffer_position() as usize;
+                    // pos는 /> 다음 바이트. 원본에서 "/>" 를 찾아서 "/" 위치를 기록
+                    if pos >= 2 && &xml[pos-2..pos] == "/>" {
+                        cell_empty_run_pos = Some(pos - 2); // "/" 위치
+                    }
+                }
 
                 if name == "cellAddr" && in_cell {
                     for attr in e.attributes().filter_map(|a| a.ok()) {
