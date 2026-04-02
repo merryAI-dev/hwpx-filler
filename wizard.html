@@ -392,29 +392,42 @@
     async function llmMapping(apiKey, sourceText, templateText) {
       const prompt = `당신은 한국 정부 양식 데이터 매핑 전문가입니다.
 
-아래에 "소스 문서"와 "대상 양식"의 테이블 구조가 있습니다.
-□는 빈 칸(데이터 입력 위치)입니다.
+## 작업
+소스 문서의 데이터를 대상 양식의 빈 칸(□)에 매핑하세요.
 
-소스 문서에서 데이터를 추출하고, 대상 양식의 빈 칸(□)에 어떤 값을 넣어야 하는지 매핑하세요.
+## 규칙
+1. 소스에서 라벨-값 쌍을 파악: [라벨] 옆의 [값] → 라벨=값
+2. 대상 양식에서 같은 의미의 라벨 옆 □의 row, col 좌표에 값을 매핑
+3. 경력/사업 테이블: 소스의 데이터 행을 대상의 빈 행에 순서대로 대응
+4. 소스에 없는 데이터는 건너뛰기 (빈 값 넣지 말 것)
+5. 민감정보(주민등록번호, 여권번호) 제외
+6. □ 위치의 row와 col이 매핑 좌표
 
-규칙:
-- 소스의 라벨-값 쌍을 파악하세요 (예: [성 명] 옆의 [해민영] → 성명=해민영)
-- 대상 양식에서 같은 의미의 라벨 옆 □에 값을 매핑하세요
-- 경력/사업 테이블은 행 순서대로 대응하세요
-- 매핑할 수 없는 필드는 건너뛰세요
-- 주민등록번호 같은 민감정보는 제외하세요
+## 예시
+
+소스:
+Table 0 (2행 × 6열):
+  Row 0: [성 명] [김철수] [직 책] [대리] [생년] [1990.03.15]
+  Row 1: [E-mail] [kim@test.com] [휴대전화] [010-1111-2222]
+
+대상:
+Table 0 (2행 × 8열):
+  Row 0: [성 명] [□] [소 속] [□] [직책/직위] [□] [연 령] [□]
+  Row 1: [학 력] [□] [근무기간] [□]
+
+올바른 매핑:
+- "김철수" → 대상 Row 0, Col 1 (성 명 옆 □)
+- "대리" → 대상 Row 0, Col 5 (직책/직위 옆 □)
+- "1990.03.15" → 대상 Row 0, Col 7 (연 령 옆 □... 생년이므로)
+- "소 속"은 소스에 없으므로 건너뜀
+
+## 실제 데이터
 
 [소스 문서]
 ${sourceText}
 
 [대상 양식]
-${templateText}
-
-JSON 배열로만 응답하세요:
-[{"row": 0, "col": 1, "value": "해민영", "label": "성명", "targetLabel": "성 명"}, ...]
-
-row와 col은 대상 양식의 셀 좌표입니다.
-JSON만 반환하세요. 설명 없이.`;
+${templateText}`;
 
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -426,19 +439,44 @@ JSON만 반환하세요. 설명 없이.`;
         },
         body: JSON.stringify({
           model: 'claude-sonnet-4-20250514',
-          max_tokens: 4096,
+          max_tokens: 8192,
           messages: [{ role: 'user', content: prompt }],
+          output_config: {
+            format: {
+              type: "json_schema",
+              schema: {
+                type: "object",
+                properties: {
+                  mappings: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        row: { type: "integer", description: "대상 양식의 행 번호" },
+                        col: { type: "integer", description: "대상 양식의 열 번호" },
+                        value: { type: "string", description: "채울 값" },
+                        sourceLabel: { type: "string", description: "소스의 라벨명" },
+                        targetLabel: { type: "string", description: "대상의 라벨명" }
+                      },
+                      required: ["row", "col", "value", "targetLabel"],
+                      additionalProperties: false
+                    }
+                  }
+                },
+                required: ["mappings"],
+                additionalProperties: false
+              }
+            }
+          }
         }),
       });
 
       const data = await resp.json();
       if (data.error) throw new Error(data.error.message);
 
-      const text = data.content[0].text;
-      const match = text.match(/\[[\s\S]*\]/);
-      if (!match) throw new Error('LLM 응답에서 JSON을 찾을 수 없음');
-
-      return JSON.parse(match[0]);
+      // structured outputs → guaranteed valid JSON, regex 불필요
+      const result = JSON.parse(data.content[0].text);
+      return result.mappings;
     }
 
     function executeAndDownload() {
