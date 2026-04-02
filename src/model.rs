@@ -94,151 +94,160 @@ pub struct Run {
     pub char_pr_id_ref: Option<u32>,
 }
 
-/// Run 내부에 올 수 있는 요소들
-/// openhwp의 `$value` enum 패턴. 폼 필러가 조작하는 것(Text, Table)만 구조화하고,
-/// 나머지(ctrl, secPr, 도형 등)는 raw XML로 보존해서 재직렬화 시 무손실.
-#[derive(Debug, Clone, PartialEq)]
+/// Run 내부에 올 수 있는 모든 요소 — openhwp KS X 6101:2024 완전 커버
+/// Text/Table은 구조화, 나머지는 serde_json::Value로 보존
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RunContent {
-    Text(String),
+    // ── 폼 필러 핵심 ──
+    /// 텍스트 요소 — 내부에 lineBreak, tab 등 포함 가능
+    #[serde(rename = "t")]
+    Text(TextElement),
+    /// 표
+    #[serde(rename = "tbl")]
     Table(Box<Table>),
-    /// 기타 모든 요소 — 원본 XML 태그명 + 내용을 그대로 보존
-    Other { tag: String, raw: String },
+
+    // ── 구조 요소 ──
+    #[serde(rename = "secPr")]
+    SectionDef(serde_json::Value),
+    #[serde(rename = "ctrl")]
+    Control(serde_json::Value),
+
+    // ── 도형 ──
+    #[serde(rename = "pic")]
+    Picture(serde_json::Value),
+    #[serde(rename = "line")]
+    Line(serde_json::Value),
+    #[serde(rename = "rect")]
+    Rectangle(serde_json::Value),
+    #[serde(rename = "ellipse")]
+    Ellipse(serde_json::Value),
+    #[serde(rename = "arc")]
+    Arc(serde_json::Value),
+    #[serde(rename = "polygon")]
+    Polygon(serde_json::Value),
+    #[serde(rename = "curve")]
+    Curve(serde_json::Value),
+    #[serde(rename = "connectLine")]
+    ConnectLine(serde_json::Value),
+
+    // ── OLE/수식/컨테이너 ──
+    #[serde(rename = "ole")]
+    Ole(serde_json::Value),
+    #[serde(rename = "equation")]
+    Equation(serde_json::Value),
+    #[serde(rename = "container")]
+    Container(serde_json::Value),
+
+    // ── 텍스트 장식 ──
+    #[serde(rename = "textart")]
+    TextArt(serde_json::Value),
+    #[serde(rename = "compose")]
+    Compose(serde_json::Value),
+    #[serde(rename = "dutmal")]
+    Dutmal(serde_json::Value),
+
+    // ── 폼 컨트롤 (openhwp에 있지만 우리에게 빠졌던 것들) ──
+    #[serde(rename = "btn")]
+    Button(serde_json::Value),
+    #[serde(rename = "radioBtn")]
+    RadioButton(serde_json::Value),
+    #[serde(rename = "checkBtn")]
+    CheckButton(serde_json::Value),
+    #[serde(rename = "comboBox")]
+    ComboBox(serde_json::Value),
+    #[serde(rename = "listBox")]
+    ListBox(serde_json::Value),
+    #[serde(rename = "edit")]
+    Edit(serde_json::Value),
+    #[serde(rename = "scrollBar")]
+    ScrollBar(serde_json::Value),
+
+    // ── 미디어 ──
+    #[serde(rename = "video")]
+    Video(serde_json::Value),
+    #[serde(rename = "chart")]
+    Chart(serde_json::Value),
+
+    // ── 기타 ──
+    #[serde(rename = "unknownObject")]
+    UnknownObject(serde_json::Value),
 }
 
-// 출력은 patcher.rs(XML 스트리밍)을 사용하므로 Serialize는 최소한만 구현.
-// serde serialize는 구조 분석용 재파싱에만 사용.
-impl Serialize for RunContent {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        match self {
-            RunContent::Text(s) => {
-                // <t>text</t>
-                #[derive(Serialize)]
-                #[serde(rename = "t")]
-                struct W<'a>(#[serde(rename = "$text")] &'a str);
-                W(s).serialize(serializer)
-            }
-            RunContent::Table(t) => t.serialize(serializer),
-            RunContent::Other { .. } => {
-                // 알 수 없는 요소는 재직렬화에서 drop
-                // (폼 필러는 테이블 셀 내용만 수정하므로 Run-level other는 영향 없음)
-                serializer.serialize_none()
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for RunContent {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        // Text/Table만 구조화, 나머지 20+ HWPX 요소는 serde_json::Value로 보존.
-        #[derive(Deserialize)]
-        enum Full {
-            #[serde(rename = "t")]
-            Text(String),
-            #[serde(rename = "tbl")]
-            Table(Box<Table>),
-            #[serde(rename = "secPr")]
-            SecPr(serde_json::Value),
-            #[serde(rename = "ctrl")]
-            Ctrl(serde_json::Value),
-            #[serde(rename = "pic")]
-            Pic(serde_json::Value),
-            #[serde(rename = "line")]
-            Line(serde_json::Value),
-            #[serde(rename = "rect")]
-            Rect(serde_json::Value),
-            #[serde(rename = "ellipse")]
-            Ellipse(serde_json::Value),
-            #[serde(rename = "arc")]
-            Arc(serde_json::Value),
-            #[serde(rename = "polygon")]
-            Polygon(serde_json::Value),
-            #[serde(rename = "curve")]
-            Curve(serde_json::Value),
-            #[serde(rename = "ole")]
-            Ole(serde_json::Value),
-            #[serde(rename = "equation")]
-            Equation(serde_json::Value),
-            #[serde(rename = "textart")]
-            TextArt(serde_json::Value),
-            #[serde(rename = "container")]
-            Container(serde_json::Value),
-            #[serde(rename = "video")]
-            Video(serde_json::Value),
-            #[serde(rename = "chart")]
-            Chart(serde_json::Value),
-            #[serde(rename = "btn")]
-            Btn(serde_json::Value),
-            #[serde(rename = "edit")]
-            Edit(serde_json::Value),
-            #[serde(rename = "compose")]
-            Compose(serde_json::Value),
-            #[serde(rename = "dutmal")]
-            Dutmal(serde_json::Value),
-            #[serde(rename = "connectLine")]
-            ConnectLine(serde_json::Value),
-            #[serde(rename = "unknownObject")]
-            UnknownObject(serde_json::Value),
-        }
-
-        let full = Full::deserialize(deserializer)?;
-        Ok(match full {
-            Full::Text(s) => RunContent::Text(s),
-            Full::Table(t) => RunContent::Table(t),
-            Full::SecPr(v) => RunContent::Other { tag: "secPr".into(), raw: v.to_string() },
-            Full::Ctrl(v) => RunContent::Other { tag: "ctrl".into(), raw: v.to_string() },
-            Full::Pic(v) => RunContent::Other { tag: "pic".into(), raw: v.to_string() },
-            Full::Line(v) => RunContent::Other { tag: "line".into(), raw: v.to_string() },
-            Full::Rect(v) => RunContent::Other { tag: "rect".into(), raw: v.to_string() },
-            Full::Ellipse(v) => RunContent::Other { tag: "ellipse".into(), raw: v.to_string() },
-            Full::Arc(v) => RunContent::Other { tag: "arc".into(), raw: v.to_string() },
-            Full::Polygon(v) => RunContent::Other { tag: "polygon".into(), raw: v.to_string() },
-            Full::Curve(v) => RunContent::Other { tag: "curve".into(), raw: v.to_string() },
-            Full::Ole(v) => RunContent::Other { tag: "ole".into(), raw: v.to_string() },
-            Full::Equation(v) => RunContent::Other { tag: "equation".into(), raw: v.to_string() },
-            Full::TextArt(v) => RunContent::Other { tag: "textart".into(), raw: v.to_string() },
-            Full::Container(v) => RunContent::Other { tag: "container".into(), raw: v.to_string() },
-            Full::Video(v) => RunContent::Other { tag: "video".into(), raw: v.to_string() },
-            Full::Chart(v) => RunContent::Other { tag: "chart".into(), raw: v.to_string() },
-            Full::Btn(v) => RunContent::Other { tag: "btn".into(), raw: v.to_string() },
-            Full::Edit(v) => RunContent::Other { tag: "edit".into(), raw: v.to_string() },
-            Full::Compose(v) => RunContent::Other { tag: "compose".into(), raw: v.to_string() },
-            Full::Dutmal(v) => RunContent::Other { tag: "dutmal".into(), raw: v.to_string() },
-            Full::ConnectLine(v) => RunContent::Other { tag: "connectLine".into(), raw: v.to_string() },
-            Full::UnknownObject(v) => RunContent::Other { tag: "unknownObject".into(), raw: v.to_string() },
-        })
-    }
-}
-
-// ── SectionDef (섹션 정의, 보존만) ──
-// 복잡하지만 수정할 일이 없으므로 serde_json::Value로 보존
+// ── TextElement: <hp:t> 내부 — 텍스트 + 인라인 마크업 ──
+// openhwp의 TextElement + TextMarkup 패턴
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename = "secPr")]
-pub struct SectionDef {
-    #[serde(rename = "$value", default)]
-    pub children: Vec<serde_json::Value>,
+#[serde(rename = "t")]
+pub struct TextElement {
+    #[serde(rename = "$value", default, skip_serializing_if = "Vec::is_empty")]
+    pub contents: Vec<TextMarkup>,
+}
 
-    // 속성들 — 알려진 것만 명시, 나머지는 flatten
-    #[serde(rename = "@id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(rename = "@textDirection", skip_serializing_if = "Option::is_none")]
-    pub text_direction: Option<String>,
-    #[serde(rename = "@spaceColumns", skip_serializing_if = "Option::is_none")]
-    pub space_columns: Option<String>,
-    #[serde(rename = "@tabStop", skip_serializing_if = "Option::is_none")]
-    pub tab_stop: Option<String>,
-    #[serde(rename = "@tabStopVal", skip_serializing_if = "Option::is_none")]
-    pub tab_stop_val: Option<String>,
-    #[serde(rename = "@tabStopUnit", skip_serializing_if = "Option::is_none")]
-    pub tab_stop_unit: Option<String>,
-    #[serde(rename = "@outlineShapeIDRef", skip_serializing_if = "Option::is_none")]
-    pub outline_shape_id_ref: Option<String>,
-    #[serde(rename = "@memoShapeIDRef", skip_serializing_if = "Option::is_none")]
-    pub memo_shape_id_ref: Option<String>,
-    #[serde(rename = "@textVerticalWidthHead", skip_serializing_if = "Option::is_none")]
-    pub text_vertical_width_head: Option<String>,
-    #[serde(rename = "@masterPageCnt", skip_serializing_if = "Option::is_none")]
-    pub master_page_cnt: Option<String>,
+impl TextElement {
+    /// 텍스트만 추출 (lineBreak는 \n으로)
+    pub fn text(&self) -> String {
+        let mut s = String::new();
+        for m in &self.contents {
+            match m {
+                TextMarkup::Text(t) => s.push_str(t),
+                TextMarkup::LineBreak(_) => s.push('\n'),
+                TextMarkup::Tab(_) => s.push('\t'),
+                TextMarkup::NonBreakingSpace(_) => s.push(' '),
+                TextMarkup::FixedWidthSpace(_) => s.push(' '),
+                _ => {} // markpen, titleMark 등은 텍스트 없음
+            }
+        }
+        s
+    }
+
+    /// 텍스트 교체 — 모든 마크업을 제거하고 단순 텍스트로
+    pub fn set_text(&mut self, new_text: &str) {
+        self.contents = vec![TextMarkup::Text(new_text.to_string())];
+    }
+}
+
+/// <hp:t> 내부의 마크업 — openhwp TextMarkup 완전 커버
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TextMarkup {
+    /// 순수 텍스트
+    #[serde(rename = "$text")]
+    Text(String),
+    /// 줄바꿈
+    #[serde(rename = "lineBreak")]
+    LineBreak(serde_json::Value),
+    /// 탭
+    #[serde(rename = "tab")]
+    Tab(serde_json::Value),
+    /// 하이픈
+    #[serde(rename = "hyphen")]
+    Hyphen(serde_json::Value),
+    /// 비분리 공백
+    #[serde(rename = "nbSpace")]
+    NonBreakingSpace(serde_json::Value),
+    /// 고정폭 공백
+    #[serde(rename = "fwSpace")]
+    FixedWidthSpace(serde_json::Value),
+    /// 형광펜 시작
+    #[serde(rename = "markpenBegin")]
+    MarkPenBegin(serde_json::Value),
+    /// 형광펜 종료
+    #[serde(rename = "markpenEnd")]
+    MarkPenEnd(serde_json::Value),
+    /// 제목 표시
+    #[serde(rename = "titleMark")]
+    TitleMark(serde_json::Value),
+    /// 삽입 추적 시작
+    #[serde(rename = "insertBegin")]
+    InsertBegin(serde_json::Value),
+    /// 삽입 추적 종료
+    #[serde(rename = "insertEnd")]
+    InsertEnd(serde_json::Value),
+    /// 삭제 추적 시작
+    #[serde(rename = "deleteBegin")]
+    DeleteBegin(serde_json::Value),
+    /// 삭제 추적 종료
+    #[serde(rename = "deleteEnd")]
+    DeleteEnd(serde_json::Value),
 }
 
 // ── Table ──
@@ -487,31 +496,31 @@ impl Table {
 }
 
 impl TableCell {
-    /// 셀 텍스트 추출 — RunContent::Text를 모아서 반환
+    /// 셀 텍스트 추출 — 모든 TextElement의 text()를 합침
     pub fn text(&self) -> String {
         self.sub_list.paragraphs.iter()
             .flat_map(|p| &p.runs)
             .flat_map(|r| &r.contents)
             .filter_map(|c| match c {
-                RunContent::Text(s) => Some(s.as_str()),
+                RunContent::Text(te) => Some(te.text()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("")
     }
 
-    /// 셀 텍스트 교체 — 첫 번째 Text만 교체, 나머지 Text는 비움
+    /// 셀 텍스트 교체 — 첫 번째 TextElement만 교체, 나머지는 비움
     pub fn set_text(&mut self, new_text: &str) {
         let mut first = true;
         for para in &mut self.sub_list.paragraphs {
             for run in &mut para.runs {
                 for content in &mut run.contents {
-                    if let RunContent::Text(s) = content {
+                    if let RunContent::Text(te) = content {
                         if first {
-                            *s = new_text.to_string();
+                            te.set_text(new_text);
                             first = false;
                         } else {
-                            *s = String::new();
+                            te.set_text("");
                         }
                     }
                 }

@@ -33,21 +33,32 @@ mod tests {
         let section = parse_section(xml).unwrap();
         assert_eq!(section.paragraphs.len(), 1);
         assert_eq!(section.paragraphs[0].runs.len(), 1);
-        let text = match &section.paragraphs[0].runs[0].contents[0] {
-            crate::model::RunContent::Text(s) => s.clone(),
-            _ => panic!("expected Text"),
-        };
-        assert_eq!(text, "hello");
+        match &section.paragraphs[0].runs[0].contents[0] {
+            crate::model::RunContent::Text(te) => assert_eq!(te.text(), "hello"),
+            other => panic!("expected Text, got {:?}", other),
+        }
     }
 
     #[test]
     fn parse_run_with_mixed_content() {
-        // Run에 secPr + t가 섞인 경우 — openhwp의 $value 패턴
         let xml = r#"<sec><p id="0"><run charPrIDRef="1"><secPr id=""/><t>text</t></run></p></sec>"#;
         let section = parse_section(xml).unwrap();
         let run = &section.paragraphs[0].runs[0];
         assert_eq!(run.contents.len(), 2);
-        assert!(matches!(&run.contents[0], crate::model::RunContent::Other { tag, .. } if tag == "secPr"));
-        assert!(matches!(&run.contents[1], crate::model::RunContent::Text(s) if s == "text"));
+        assert!(matches!(&run.contents[0], crate::model::RunContent::SectionDef(_)));
+        match &run.contents[1] {
+            crate::model::RunContent::Text(te) => assert_eq!(te.text(), "text"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_text_with_linebreak() {
+        let xml = r#"<sec><p id="0"><run charPrIDRef="1"><t>line1<lineBreak/>line2</t></run></p></sec>"#;
+        let section = parse_section(xml).unwrap();
+        match &section.paragraphs[0].runs[0].contents[0] {
+            crate::model::RunContent::Text(te) => assert_eq!(te.text(), "line1\nline2"),
+            other => panic!("expected Text, got {:?}", other),
+        }
     }
 }
