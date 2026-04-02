@@ -119,3 +119,48 @@ pub fn clone_rows(
 
     Ok(output)
 }
+
+// ── Wizard용 신규 exports ──
+
+/// HWPX 데이터 추출 — 채워진 양식에서 label:value 쌍 추출
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "extractData")]
+pub fn extract_data_wasm(hwpx_bytes: &[u8]) -> Result<AnalysisResult, JsError> {
+    let text_files = crate::zipper::extract_text_files(hwpx_bytes)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let section0 = text_files.get("Contents/section0.xml")
+        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+    let fields = crate::extractor::extract_data(section0);
+    let json = serde_json::to_string(&fields)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(AnalysisResult { json })
+}
+
+/// CSV 데이터 추출 — Firebase export 등
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "extractCsv")]
+pub fn extract_csv_wasm(csv_text: &str) -> Result<AnalysisResult, JsError> {
+    let fields = crate::extractor::extract_csv(csv_text);
+    let json = serde_json::to_string(&fields)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(AnalysisResult { json })
+}
+
+/// 데이터 → 양식 매핑 (상세 결과 + match_type)
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "mapToForm")]
+pub fn map_to_form_wasm(
+    extracted_json: &str,
+    form_fields_json: &str,
+) -> Result<AnalysisResult, JsError> {
+    let extracted: Vec<crate::extractor::ExtractedField> =
+        serde_json::from_str(extracted_json)
+            .map_err(|e| JsError::new(&format!("extracted JSON error: {}", e)))?;
+    let form_fields: Vec<crate::stream_analyzer::FieldInfo> =
+        serde_json::from_str(form_fields_json)
+            .map_err(|e| JsError::new(&format!("fields JSON error: {}", e)))?;
+    let result = crate::extractor::map_extracted_to_form_detailed(&extracted, &form_fields);
+    let json = serde_json::to_string(&result)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(AnalysisResult { json })
+}

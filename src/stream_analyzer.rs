@@ -37,7 +37,7 @@ pub struct TableInfo {
 }
 
 /// 셀 내용물 타입 — serde enrichment로 알 수 있는 것
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentType {
     /// 순수 텍스트만 — 교체 안전
@@ -57,7 +57,7 @@ pub enum ContentType {
 }
 
 /// 분석된 필드 (label → data 매핑)
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FieldInfo {
     pub table_index: usize,

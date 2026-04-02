@@ -11,7 +11,7 @@
 use crate::stream_analyzer;
 
 /// 추출된 필드 데이터
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtractedField {
     /// 원본 라벨 텍스트 (공백 포함, 그대로)
@@ -114,6 +114,160 @@ pub fn map_extracted_to_form(
     }
 
     patches
+}
+
+/// CSV 텍스트에서 데이터 추출 (Firebase export 등)
+/// 첫 행 = 헤더(key), 데이터 행 = value
+pub fn extract_csv(csv_text: &str) -> Vec<ExtractedField> {
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .has_headers(true)
+        .from_reader(csv_text.as_bytes());
+
+    let headers: Vec<String> = match reader.headers() {
+        Ok(h) => h.iter().map(|s| s.to_string()).collect(),
+        Err(_) => return Vec::new(),
+    };
+
+    // 첫 번째 데이터 행만 사용
+    let record = match reader.records().next() {
+        Some(Ok(r)) => r,
+        _ => return Vec::new(),
+    };
+
+    headers.iter().enumerate().filter_map(|(i, header)| {
+        let value = record.get(i).unwrap_or("").trim().to_string();
+        if header.trim().is_empty() || value.is_empty() {
+            return None;
+        }
+        let raw = header.trim().to_string();
+        let normalized = normalize_label(&raw);
+        let key = canonical_or_normalized(&normalized);
+        Some(ExtractedField {
+            raw_label: raw,
+            normalized_label: normalized,
+            key,
+            value,
+            table_index: 0,
+            row: 0,
+            col: i as u32,
+        })
+    }).collect()
+}
+
+// ── 상세 매핑 (wizard용) ──
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingResult {
+    pub patches: Vec<PatchInfo>,
+    pub mappings: Vec<MappingInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchInfo {
+    pub table_index: usize,
+    pub row: u32,
+    pub col: u32,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingInfo {
+    pub source_key: String,
+    pub source_value: String,
+    pub target_label: String,
+    pub target_table_index: usize,
+    pub target_row: u32,
+    pub target_col: u32,
+    pub match_type: String,
+}
+
+/// 상세 매핑 — wizard의 미리보기 테이블용
+/// 기존 map_extracted_to_form과 같은 3-tier 로직이지만 match_type 기록 + unmatched 포함
+pub fn map_extracted_to_form_detailed(
+    extracted: &[ExtractedField],
+    form_fields: &[stream_analyzer::FieldInfo],
+) -> MappingResult {
+    let mut patches = Vec::new();
+    let mut mappings = Vec::new();
+    let mut used = vec![false; extracted.len()];
+
+    for field in form_fields {
+        let form_key = &field.canonical_key;
+        let form_label = normalize_label(&field.label);
+
+        // 1. canonical key 매칭
+        if let Some((i, ex)) = extracted.iter().enumerate()
+            .find(|(i, ex)| !used[*i] && ex.key == *form_key && form_key != "unknown")
+        {
+            patches.push(PatchInfo {
+                table_index: field.table_index, row: field.row, col: field.col,
+                value: ex.value.clone(),
+            });
+            mappings.push(MappingInfo {
+                source_key: ex.key.clone(), source_value: ex.value.clone(),
+                target_label: field.label.clone(),
+                target_table_index: field.table_index, target_row: field.row, target_col: field.col,
+                match_type: "canonical".to_string(),
+            });
+            used[i] = true;
+            continue;
+        }
+
+        // 2. normalized label 완전 일치
+        if let Some((i, ex)) = extracted.iter().enumerate()
+            .find(|(i, ex)| !used[*i] && ex.normalized_label == form_label)
+        {
+            patches.push(PatchInfo {
+                table_index: field.table_index, row: field.row, col: field.col,
+                value: ex.value.clone(),
+            });
+            mappings.push(MappingInfo {
+                source_key: ex.key.clone(), source_value: ex.value.clone(),
+                target_label: field.label.clone(),
+                target_table_index: field.table_index, target_row: field.row, target_col: field.col,
+                match_type: "normalized".to_string(),
+            });
+            used[i] = true;
+            continue;
+        }
+
+        // 3. fuzzy
+        if let Some((i, ex)) = extracted.iter().enumerate()
+            .find(|(i, ex)| {
+                !used[*i] && (
+                    ex.normalized_label.contains(&form_label) ||
+                    form_label.contains(&ex.normalized_label)
+                ) && ex.normalized_label.len() > 1 && form_label.len() > 1
+            })
+        {
+            patches.push(PatchInfo {
+                table_index: field.table_index, row: field.row, col: field.col,
+                value: ex.value.clone(),
+            });
+            mappings.push(MappingInfo {
+                source_key: ex.key.clone(), source_value: ex.value.clone(),
+                target_label: field.label.clone(),
+                target_table_index: field.table_index, target_row: field.row, target_col: field.col,
+                match_type: "fuzzy".to_string(),
+            });
+            used[i] = true;
+            continue;
+        }
+
+        // 4. unmatched
+        mappings.push(MappingInfo {
+            source_key: String::new(), source_value: String::new(),
+            target_label: field.label.clone(),
+            target_table_index: field.table_index, target_row: field.row, target_col: field.col,
+            match_type: "unmatched".to_string(),
+        });
+    }
+
+    MappingResult { patches, mappings }
 }
 
 /// 라벨 정규화: 공백 제거, 줄바꿈 → 공백, 특수문자 제거
