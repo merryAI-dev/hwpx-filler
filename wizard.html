@@ -170,10 +170,17 @@
     <!-- Step 3: Mapping Preview -->
     <div class="step" id="step3">
       <h2>3. 매핑 확인</h2>
-      <p class="step-desc">자동 매핑 결과를 확인하고, 필요하면 수정하세요.</p>
+      <p class="step-desc">규칙 기반 자동 매핑 결과를 먼저 확인한 뒤, 필요하면 AI 보완이나 수동 수정으로 HITL 검토를 진행하세요.</p>
       <div id="mapping-status"></div>
       <div id="mapping-table-wrap"></div>
       <div class="llm-section" id="llm-section" style="display:none">
+        <h3>AI 보완</h3>
+        <p id="llm-help" style="font-size:12px;color:#64748b;margin-bottom:10px">
+          규칙 기반으로 안 잡힌 필드만 AI가 보완합니다. 내용을 확인한 뒤 직접 버튼을 눌러 실행하세요.
+        </p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-outline" id="btn-llm-assist" onclick="llmAssist()">AI로 미매핑 보완</button>
+        </div>
         <div id="llm-status"></div>
       </div>
       <div class="btn-row">
@@ -306,7 +313,9 @@
     // llmAssist: 미매핑 잔여 필드를 WASM callAnthropic으로 처리
     // 소스 키(라벨명)만 전달 — 값은 포함 안 함
     window.llmAssist = async () => {
+      const btn = document.getElementById('btn-llm-assist');
       if (!hasApiKey()) { showStatus('llm-status', 'error', 'API 키를 먼저 입력하세요'); return; }
+      if (!S.editedMappings?.length) { showStatus('llm-status', 'error', '먼저 매핑 결과를 계산하세요'); return; }
 
       const unmatched = S.editedMappings.filter(m => m.matchType === 'unmatched');
       if (unmatched.length === 0) { showStatus('llm-status', 'success', '미매핑 필드 없음'); return; }
@@ -315,6 +324,7 @@
       const targetLabels = unmatched.map(m => m.targetLabel);
       const sourceLabels = S.sourceData.map(s => s.rawLabel || s.key);
 
+      btn.disabled = true;
       showStatus('llm-status', 'info', `AI가 미매핑 ${unmatched.length}개 필드를 자동 매칭 중...`);
 
       try {
@@ -357,6 +367,8 @@
         showStatus('llm-status', 'success', `${applied}개 필드 자동 매핑됨`);
       } catch (e) {
         showStatus('llm-status', 'error', `LLM 오류: ${e.message}`);
+      } finally {
+        btn.disabled = false;
       }
     };
 
@@ -377,53 +389,12 @@
     async function computeMapping() {
       S.llmLabelPairs = null;
       S.useLlmPath = false;
-      let llmFullFailed = false;
+      showStatus('mapping-status', 'info', '규칙 기반으로 기본 매핑을 계산하고 있습니다...');
+      document.getElementById('llm-status').innerHTML = '';
 
-      if (hasApiKey() && S.sourceBytes && S.templateText) {
-        showStatus('mapping-status', 'info', 'LLM이 라벨 구조를 분석하고 있습니다...');
-        try {
-          // 소스: 라벨 이름만 추출 (값은 WASM 내부에 보관)
-          const srcLabels = JSON.parse(extractLabelsOnly(S.sourceBytes));
-          // 대상: □ 위치 포함 구조 (이미 formatForLLM으로 생성됨)
-          const pairs = await llmLabelMatch(srcLabels, S.templateText);
-
-          S.llmLabelPairs = pairs;
-          S.useLlmPath = true;
-
-          // UI 표시용: 라벨 쌍 → sourceData에서 값 조회 (로컬)
-          const norm = s => (s || '').replace(/\s/g, '').toLowerCase();
-          S.editedMappings = pairs.map(p => {
-            const src = S.sourceData?.find(s => norm(s.rawLabel || s.key) === norm(p.sourceLabel));
-            const tpl = S.formFields?.find(f => norm(f.label) === norm(p.targetLabel));
-            return {
-              sourceKey: src?.key || p.sourceLabel || '',
-              sourceValue: src?.value || '',
-              targetLabel: p.targetLabel || '',
-              targetTableIndex: tpl?.tableIndex ?? 0,
-              targetRow: tpl?.row ?? 0,
-              targetCol: tpl?.col ?? 0,
-              matchType: src?.value ? 'llm' : 'unmatched',
-            };
-          });
-          renderMappingTable();
-          return;
-        } catch (e) {
-          llmFullFailed = true;
-          console.warn('LLM mapping failed, falling back to rules:', e);
-          showStatus('mapping-status', 'info', `LLM 실패 (${e.message}), 규칙 기반으로 전환...`);
-        }
-      }
-
-      // Fallback: 규칙 기반 매핑
       const result = mapToForm(JSON.stringify(S.sourceData), JSON.stringify(S.formFields));
       S.editedMappings = structuredClone(JSON.parse(result.json).mappings);
       renderMappingTable();
-
-      // 미매핑 잔여 필드 → AI 자동 처리 (API 키 있고 LLM이 직전에 실패하지 않은 경우)
-      if (hasApiKey() && !llmFullFailed) {
-        const unmatchedCount = S.editedMappings.filter(m => m.matchType === 'unmatched').length;
-        if (unmatchedCount > 0) await llmAssist();
-      }
     }
 
     // LLM에게 라벨 목록만 전달 → [{sourceLabel, targetLabel}] 쌍 반환
@@ -471,10 +442,14 @@ ${templateText}`;
 
     function executeAndDownload() {
       let output;
+      let filled = 0;
+      let skipped = 0;
       if (S.useLlmPath && S.sourceBytes && S.llmLabelPairs) {
         // LLM 경로: 값 조회 + 좌표 계산 모두 WASM 내부에서 완결
         // JS는 label_pairs만 전달 — 값도 좌표도 JS를 경유하지 않음
         output = applyLabelMappings(S.sourceBytes, S.templateBytes, JSON.stringify(S.llmLabelPairs));
+        filled = S.editedMappings.filter(m => m.matchType !== 'unmatched' && (m.sourceValue || m.value)).length;
+        skipped = S.editedMappings.length - filled;
       } else {
         // Rules 경로: editedMappings의 값으로 fillForm
         const patches = S.editedMappings
@@ -486,6 +461,8 @@ ${templateText}`;
             value: m.sourceValue || m.value || '',
           }));
         output = fillForm(S.templateBytes, JSON.stringify(patches));
+        filled = patches.length;
+        skipped = S.editedMappings.length - filled;
       }
       const blob = new Blob([output], { type: 'application/octet-stream' });
       const url = URL.createObjectURL(blob);
@@ -495,8 +472,6 @@ ${templateText}`;
       a.click();
       URL.revokeObjectURL(url);
 
-      const filled = patches.length;
-      const skipped = S.editedMappings.length - filled;
       document.getElementById('done-summary').innerHTML =
         `<p style="font-size:18px;font-weight:600;margin-bottom:8px">${filled}개 필드 채움 완료</p>` +
         `<p style="color:#64748b">${skipped > 0 ? skipped + '개 필드 미매핑 (건너뜀)' : '모든 필드 매핑됨'}</p>`;
@@ -532,11 +507,12 @@ ${templateText}`;
     function renderMappingTable() {
       const m = S.editedMappings;
       const unmatched = m.filter(x => x.matchType === 'unmatched').length;
+      const hasKey = hasApiKey();
 
       let statusHtml = '';
       const matched = m.length - unmatched;
       if (unmatched > 0) {
-        statusHtml = `<div class="status status-info">${matched}/${m.length} 자동 매핑 · <strong>${unmatched}개 미매핑</strong> — 아래에서 수동 선택하거나 LLM Assist를 사용하세요</div>`;
+        statusHtml = `<div class="status status-info">${matched}/${m.length} 규칙 기반 자동 매핑 · <strong>${unmatched}개 미매핑</strong> — 아래에서 수동 수정하거나 AI 보완 버튼을 눌러 진행하세요</div>`;
       } else {
         statusHtml = `<div class="status status-success">${m.length}/${m.length} 전부 매핑됨</div>`;
       }
@@ -564,12 +540,20 @@ ${templateText}`;
       html += '</tbody></table>';
       document.getElementById('mapping-table-wrap').innerHTML = html;
 
-      // LLM section visibility
-      document.getElementById('llm-section').style.display = unmatched > 0 ? 'block' : 'none';
+      const llmSection = document.getElementById('llm-section');
+      const llmHelp = document.getElementById('llm-help');
+      const llmBtn = document.getElementById('btn-llm-assist');
 
-      // Restore saved API key
-      const saved = localStorage.getItem('anthropic_api_key');
-      if (saved) document.getElementById('api-key').value = saved;
+      llmSection.style.display = m.length > 0 ? 'block' : 'none';
+      llmBtn.disabled = unmatched === 0;
+
+      if (unmatched === 0) {
+        llmHelp.textContent = '현재는 미매핑 필드가 없습니다. 필요하면 수동으로 수정한 뒤 다음 단계로 진행하세요.';
+      } else if (!hasKey) {
+        llmHelp.textContent = 'API 키를 저장한 뒤 버튼을 눌러 미매핑 필드를 AI로 보완할 수 있습니다.';
+      } else {
+        llmHelp.textContent = '규칙 기반으로 안 잡힌 필드만 AI가 보완합니다. 내용을 확인한 뒤 직접 버튼을 눌러 실행하세요.';
+      }
     }
 
     function updateProgress(step) {
