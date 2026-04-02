@@ -20,6 +20,7 @@ pub mod filler;
 pub mod analyzer;
 pub mod zipper;
 pub mod patcher;
+pub mod stream_analyzer;
 pub mod validate;
 #[cfg(feature = "wasm")]
 pub mod wasm;

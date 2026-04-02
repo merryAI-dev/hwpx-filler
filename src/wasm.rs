@@ -32,28 +32,12 @@ pub fn analyze_form(hwpx_bytes: &[u8]) -> Result<AnalysisResult, JsError> {
     let section0 = text_files.get("Contents/section0.xml")
         .ok_or_else(|| JsError::new("section0.xml not found"))?;
 
-    let section = crate::parser::parse_section(section0)
+    // 스트리밍 분석 — 어떤 HWPX든 동작
+    let tables = crate::stream_analyzer::analyze_xml(section0);
+    let fields = crate::stream_analyzer::extract_fields(&tables);
+
+    let json = serde_json::to_string(&fields)
         .map_err(|e| JsError::new(&e.to_string()))?;
-
-    let tables = crate::filler::collect_tables(&section);
-    let mut all_fields = Vec::new();
-
-    for (i, table) in tables.iter().enumerate() {
-        let analysis = crate::analyzer::analyze_table(table, i);
-        all_fields.extend(analysis.fields);
-    }
-
-    let json = serde_json::to_string(&all_fields.iter().map(|f| {
-        serde_json::json!({
-            "tableIndex": f.table_index,
-            "row": f.row,
-            "col": f.col,
-            "label": f.label,
-            "canonicalKey": f.canonical_key,
-            "confidence": f.confidence,
-        })
-    }).collect::<Vec<_>>())
-    .map_err(|e| JsError::new(&e.to_string()))?;
 
     Ok(AnalysisResult { json })
 }
