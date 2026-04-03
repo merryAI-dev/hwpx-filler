@@ -263,6 +263,7 @@
     </div>
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
   <script type="module">
     import init, {
       analyzeForm, analyzeFormAdaptive, inspectTables, fillForm,
@@ -293,8 +294,7 @@
     await init();
 
     // ── sql.js SQLite WASM 초기화 ──
-    const initSqlJs = (await import('https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.mjs')).default;
-    const SQL = await initSqlJs({
+    const SQL = await window.initSqlJs({
       locateFile: f => `https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/${f}`
     });
 
