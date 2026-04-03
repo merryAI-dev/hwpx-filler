@@ -5,7 +5,7 @@ compatibility_date = "2024-12-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "hwpx-policies"
-database_id = "" # wrangler d1 create hwpx-policies 후 채울 것
+database_id = "a68227eb-4700-454a-9916-3d19e234d92a"
 
 [vars]
 CORS_ORIGIN = "*"
