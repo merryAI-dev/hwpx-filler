@@ -79,6 +79,11 @@
 
     .learning-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 14px; margin-bottom: 20px; }
     .learning-toolbar .meta { font-size: 12px; color: #64748b; margin-right: auto; }
+    .toolbar-more { position: relative; display: inline-block; }
+    .toolbar-menu { display: none; position: absolute; top: 100%; right: 0; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); min-width: 180px; z-index: 10; padding: 4px 0; margin-top: 4px; }
+    .toolbar-menu.open { display: block; }
+    .toolbar-menu button { display: block; width: 100%; text-align: left; padding: 8px 14px; border: none; background: none; font-size: 13px; cursor: pointer; color: #475569; }
+    .toolbar-menu button:hover { background: #f1f5f9; }
     .learning-panel { margin-top: 16px; padding: 16px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
     .learning-panel h3 { font-size: 14px; margin-bottom: 8px; }
     .learning-panel p { font-size: 12px; color: #64748b; margin-bottom: 10px; }
@@ -112,26 +117,43 @@
     <p class="subtitle">기본 처리와 규칙 기반 매핑은 브라우저에서 실행됩니다. AI 기능을 누를 때만 필요한 라벨 또는 일부 값이 Anthropic으로 전송됩니다.</p>
     <div class="learning-toolbar">
       <div class="meta" id="learning-meta">표 인식 학습 데이터 로딩 중...</div>
-      <button class="btn btn-outline" onclick="exportLearningData()" style="padding:6px 14px;font-size:13px">학습 내보내기</button>
-      <button class="btn btn-outline" onclick="exportPolicyDb()" style="padding:6px 14px;font-size:13px">DB 내보내기</button>
-      <button class="btn btn-primary" onclick="exportCommunityJson()" style="padding:6px 14px;font-size:13px">정책 공유</button>
-      <label class="btn btn-outline" style="padding:6px 14px;font-size:13px;display:inline-flex;align-items:center;cursor:pointer">
-        학습 가져오기
-        <input type="file" accept=".json,.db" style="display:none" onchange="importLearningData(this)">
-      </label>
-      <button class="btn btn-outline" onclick="clearLearningData()" style="padding:6px 14px;font-size:13px">학습 초기화</button>
+      <button class="btn btn-primary" onclick="exportCommunityJson()" style="padding:6px 14px;font-size:13px">커뮤니티에 공유</button>
+      <div class="toolbar-more">
+        <button class="btn btn-outline" onclick="this.nextElementSibling.classList.toggle('open')" style="padding:6px 12px;font-size:13px">더보기 ▾</button>
+        <div class="toolbar-menu" id="toolbar-menu">
+          <button onclick="exportLearningData();this.parentElement.classList.remove('open')">학습 JSON 내보내기</button>
+          <button onclick="exportPolicyDb();this.parentElement.classList.remove('open')">학습 DB 내보내기</button>
+          <label style="display:block;padding:8px 14px;font-size:13px;cursor:pointer;color:#475569">
+            학습 가져오기 (.json/.db)
+            <input type="file" accept=".json,.db" style="display:none" onchange="importLearningData(this);document.getElementById('toolbar-menu').classList.remove('open')">
+          </label>
+          <button onclick="clearLearningData();this.parentElement.classList.remove('open')" style="color:#dc2626">학습 초기화</button>
+        </div>
+      </div>
     </div>
     <div id="learning-status"></div>
 
     <!-- Progress Bar -->
     <div class="progress">
-      <div class="progress-step"><div class="progress-circle active" id="pc1">1</div></div>
+      <div class="progress-step">
+        <div class="progress-circle active" id="pc1">1</div>
+        <div class="progress-label active">데이터</div>
+      </div>
       <div class="progress-line" id="pl1"></div>
-      <div class="progress-step"><div class="progress-circle" id="pc2">2</div></div>
+      <div class="progress-step">
+        <div class="progress-circle" id="pc2">2</div>
+        <div class="progress-label">양식</div>
+      </div>
       <div class="progress-line" id="pl2"></div>
-      <div class="progress-step"><div class="progress-circle" id="pc3">3</div></div>
+      <div class="progress-step">
+        <div class="progress-circle" id="pc3">3</div>
+        <div class="progress-label">매핑</div>
+      </div>
       <div class="progress-line" id="pl3"></div>
-      <div class="progress-step"><div class="progress-circle" id="pc4">4</div></div>
+      <div class="progress-step">
+        <div class="progress-circle" id="pc4">4</div>
+        <div class="progress-label">완료</div>
+      </div>
     </div>
 
     <!-- Step 1: Data Source -->
@@ -151,13 +173,15 @@
       </div>
       <div id="tab-hwpx">
         <label class="upload-box" id="src-hwpx-box">
-          <div class="upload-label">HWPX 파일 선택</div>
+          <div style="font-size:32px;margin-bottom:8px;opacity:0.4">&#128196;</div>
+          <div class="upload-label">HWPX 파일을 드래그하거나 클릭해서 선택</div>
           <div class="upload-hint">기존에 작성된 양식에서 데이터를 추출합니다</div>
           <input type="file" accept=".hwpx" onchange="handleSourceHwpx(this)">
         </label>
         <div id="batch-upload-area" style="display:none">
           <label class="upload-box" id="src-batch-box">
-            <div class="upload-label">HWPX 파일 여러 개 선택</div>
+            <div style="font-size:32px;margin-bottom:8px;opacity:0.4">&#128194;</div>
+            <div class="upload-label">HWPX 파일 여러 개를 드래그하거나 클릭해서 선택</div>
             <div class="upload-hint">이력서 N개를 한 번에 올려서 양식 N개를 자동으로 채웁니다</div>
             <input type="file" accept=".hwpx" multiple onchange="handleBatchSource(this)">
           </label>
@@ -177,8 +201,9 @@
       </div>
       <div id="source-preview"></div>
       <div id="source-structure"></div>
-      <div class="btn-row">
-        <button class="btn btn-primary" id="btn-step1-next" disabled onclick="goStep(2)">다음</button>
+      <div class="btn-row" style="align-items:center">
+        <span id="step1-hint" style="font-size:12px;color:#94a3b8">파일을 먼저 업로드하세요</span>
+        <button class="btn btn-primary" id="btn-step1-next" disabled onclick="goStep(2)">다음 →</button>
       </div>
     </div>
 
@@ -187,15 +212,17 @@
       <h2>2. 서식 템플릿</h2>
       <p class="step-desc">데이터를 채워넣을 빈 양식을 업로드하세요.</p>
       <label class="upload-box" id="tpl-box">
-        <div class="upload-label">HWPX 양식 파일 선택</div>
-        <div class="upload-hint">서식5, 서식6 등 정부 양식</div>
+        <div style="font-size:32px;margin-bottom:8px;opacity:0.4">&#128203;</div>
+        <div class="upload-label">HWPX 양식 파일을 드래그하거나 클릭해서 선택</div>
+        <div class="upload-hint">서식5, 서식6 등 정부 양식 (빈 양식)</div>
         <input type="file" accept=".hwpx" onchange="handleTemplate(this)">
       </label>
       <div id="template-preview"></div>
       <div id="template-structure"></div>
-      <div class="btn-row">
-        <button class="btn btn-secondary" onclick="goStep(1)">이전</button>
-        <button class="btn btn-primary" id="btn-step2-next" disabled onclick="goStep(3)">다음</button>
+      <div class="btn-row" style="align-items:center">
+        <button class="btn btn-secondary" onclick="goStep(1)">← 이전</button>
+        <span id="step2-hint" style="font-size:12px;color:#94a3b8">양식 파일을 먼저 업로드하세요</span>
+        <button class="btn btn-primary" id="btn-step2-next" disabled onclick="goStep(3)">다음 →</button>
       </div>
     </div>
 
@@ -1630,6 +1657,8 @@ ${templateText}`;
       html += '</tbody></table>';
       document.getElementById('source-preview').innerHTML = html;
       document.getElementById('btn-step1-next').disabled = false;
+      const h1 = document.getElementById('step1-hint');
+      if (h1) h1.style.display = 'none';
     }
 
     function renderTemplatePreview() {
@@ -1644,6 +1673,8 @@ ${templateText}`;
       html += '</tbody></table>';
       document.getElementById('template-preview').innerHTML = html;
       document.getElementById('btn-step2-next').disabled = false;
+      const h2 = document.getElementById('step2-hint');
+      if (h2) h2.style.display = 'none';
     }
 
     function renderMappingTable() {
@@ -1780,6 +1811,12 @@ ${templateText}`;
     }
 
     function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+    // Close dropdown on outside click
+    document.addEventListener('click', (e) => {
+      const menu = document.getElementById('toolbar-menu');
+      if (menu && !e.target.closest('.toolbar-more')) menu.classList.remove('open');
+    });
   </script>
 </body>
 </html>
