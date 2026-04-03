@@ -41,6 +41,8 @@ jobs:
           mkdir -p "dist/${PKG_DIR}"
           cp -r pkg/. "dist/${PKG_DIR}/"
           sed "s#\./pkg/hwpx_filler\.js#./${PKG_DIR}/hwpx_filler.js#g" wizard.html > dist/index.html
+          # Community policies (PII-free static JSON)
+          cp -r policies dist/policies 2>/dev/null || true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

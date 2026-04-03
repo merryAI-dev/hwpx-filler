@@ -33,7 +33,14 @@ pub fn fill(
     xml: &str,
     patches: &[(usize, u32, u32, String)],
 ) -> Result<String> {
-    crate::patcher::patch_cells(xml, patches)
+    let patched = crate::patcher::patch_cells(xml, patches)?;
+    let verification = crate::validate::verify_patches_applied(&patched, patches);
+    if !verification.valid {
+        return Err(crate::error::FillerError::Validation(
+            format!("패치 검증 실패: {}", verification.errors.join(" | "))
+        ));
+    }
+    Ok(patched)
 }
 
 /// 행 클론 + 셀 교체
@@ -49,7 +56,7 @@ pub fn fill_with_rows(
         result = crate::patcher::patch_clone_rows(&result, *table_idx, *row_addr, *count)?;
     }
     // 2. 셀 교체 (클론된 행의 새 주소로)
-    crate::patcher::patch_cells(&result, cell_patches)
+    fill(&result, cell_patches)
 }
 
 /// 패치 후 구조 검증

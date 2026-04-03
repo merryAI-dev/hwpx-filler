@@ -9,6 +9,7 @@
 //! 4. canonical key도 함께 제공 (알려진 패턴이면)
 
 use crate::stream_analyzer;
+use std::collections::HashSet;
 
 /// 추출된 필드 데이터
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -28,16 +29,72 @@ pub struct ExtractedField {
     pub col: u32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdaptiveExtractAnalysis {
+    pub tables: Vec<stream_analyzer::TableInfo>,
+    pub trace: Vec<stream_analyzer::TableRecognitionTrace>,
+    pub fields: Vec<ExtractedField>,
+}
+
 /// 채워진 HWPX에서 label-data 쌍 추출
 pub fn extract_data(xml: &str) -> Vec<ExtractedField> {
     let tables = stream_analyzer::analyze_xml(xml);
-    let mut fields = Vec::new();
+    extract_data_from_tables(&tables, None)
+}
 
-    for table in &tables {
+pub fn extract_data_adaptive(
+    xml: &str,
+    policy: Option<&stream_analyzer::RecognitionPolicy>,
+) -> AdaptiveExtractAnalysis {
+    let analysis = stream_analyzer::inspect_tables_adaptive(xml, policy);
+    let fields = extract_data_from_tables(&analysis.tables, Some(&analysis.trace));
+    AdaptiveExtractAnalysis {
+        tables: analysis.tables,
+        trace: analysis.trace,
+        fields,
+    }
+}
+
+fn extract_data_from_tables(
+    tables: &[stream_analyzer::TableInfo],
+    trace: Option<&[stream_analyzer::TableRecognitionTrace]>,
+) -> Vec<ExtractedField> {
+    let mut fields = Vec::new();
+    let ignored_tables = trace.map(|trace| {
+        trace.iter()
+            .filter(|table| table.selected_table_kind == stream_analyzer::TableKind::WrapperIgnore)
+            .map(|table| table.table_index)
+            .collect::<HashSet<_>>()
+    }).unwrap_or_default();
+
+    for table in tables {
+        if ignored_tables.contains(&table.index) {
+            continue;
+        }
+
+        let header_rows: HashSet<u32> = trace
+            .and_then(|trace| {
+                trace.iter().find(|candidate| candidate.table_index == table.index).map(|table_trace| {
+                    table_trace.rows.iter()
+                        .filter(|row| row.selected_kind == stream_analyzer::RowKind::Header)
+                        .map(|row| row.row)
+                        .collect()
+                })
+            })
+            .unwrap_or_else(|| {
+                table.rows.iter().enumerate()
+                    .filter_map(|(row_idx, row)| {
+                        looks_like_vertical_header_row(row, table.rows.get(row_idx + 1))
+                            .then_some(row.cells.first().map(|cell| cell.row).unwrap_or(row_idx as u32))
+                    })
+                    .collect()
+            });
+
         // Pass 1: 가로 패턴 — [Label] [Data] 같은 행
-        for (row_idx, row) in table.rows.iter().enumerate() {
-            let next_row = table.rows.get(row_idx + 1);
-            if looks_like_vertical_header_row(row, next_row) {
+        for row in &table.rows {
+            let row_addr = row.cells.first().map(|cell| cell.row).unwrap_or(0);
+            if header_rows.contains(&row_addr) {
                 continue;
             }
 
@@ -72,22 +129,25 @@ pub fn extract_data(xml: &str) -> Vec<ExtractedField> {
             .collect();
 
         // Pass 2: 세로 패턴 — 헤더 행 아래 데이터 행에서 값 추출
-        for (row_idx, row) in table.rows.iter().enumerate() {
+        for row in &table.rows {
             if row.cells.is_empty() || row.cells.len() < 3 { continue; } // 최소 3열
 
             // 이 행이 가로 패턴에서 이미 추출된 행이면 건너뜀
             let row_addr = row.cells.first().map(|c| c.row).unwrap_or(0);
             if horizontal_rows.contains(&row_addr) { continue; }
 
-            let next_row = table.rows.get(row_idx + 1);
-            if !looks_like_vertical_header_row(row, next_row) {
+            if !header_rows.contains(&row_addr) {
                 continue;
             }
 
             let header_cells: Vec<_> = row.cells.iter().collect();
+            let start_idx = table.rows.iter()
+                .position(|candidate| candidate.cells.first().map(|cell| cell.row) == Some(row_addr))
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
 
             // 아래 데이터 행들에서 값 추출
-            for data_row in table.rows.iter().skip(row_idx + 1) {
+            for data_row in table.rows.iter().skip(start_idx) {
                 let has_any_data = data_row.cells.iter().any(|c| !c.text.trim().is_empty());
                 if !has_any_data { continue; } // 완전 빈 행은 건너뜀
 
@@ -95,10 +155,14 @@ pub fn extract_data(xml: &str) -> Vec<ExtractedField> {
                 let mostly_labels = data_row.cells.iter()
                     .filter(|c| !c.text.trim().is_empty())
                     .all(|c| c.is_label);
+                let data_row_addr = data_row.cells.first().map(|c| c.row).unwrap_or(0);
+                if data_row_addr != row_addr && header_rows.contains(&data_row_addr) {
+                    break;
+                }
                 if mostly_labels && has_any_data { break; }
 
                 // 행 번호 (0-based, 헤더 이후 몇 번째 데이터인지)
-                let data_row_num = data_row.cells.first().map(|c| c.row).unwrap_or(0);
+                let data_row_num = data_row_addr;
 
                 for data_cell in &data_row.cells {
                     if data_cell.text.trim().is_empty() { continue; }

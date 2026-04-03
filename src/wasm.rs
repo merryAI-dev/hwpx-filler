@@ -195,7 +195,7 @@ pub fn apply_label_mappings(
         .collect();
 
     // 5. 패치 적용 + ZIP 재조립
-    let patched_xml = crate::patcher::patch_cells(tpl_xml, &patch_list)
+    let patched_xml = crate::filler::fill(tpl_xml, &patch_list)
         .map_err(|e| JsError::new(&e.to_string()))?;
 
     let mut modified = std::collections::HashMap::new();
@@ -223,6 +223,16 @@ impl AnalysisResult {
     }
 }
 
+#[cfg(feature = "wasm")]
+fn parse_policy_json(policy_json: &str) -> Result<crate::stream_analyzer::RecognitionPolicy, JsError> {
+    if policy_json.trim().is_empty() {
+        Ok(crate::stream_analyzer::RecognitionPolicy::default())
+    } else {
+        serde_json::from_str(policy_json)
+            .map_err(|e| JsError::new(&format!("policy JSON error: {}", e)))
+    }
+}
+
 /// HWPX 양식 분석 — 업로드된 바이트에서 테이블 구조 + 필드 매핑 추출
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "analyzeForm")]
@@ -234,6 +244,42 @@ pub fn analyze_form(hwpx_bytes: &[u8]) -> Result<AnalysisResult, JsError> {
     let tables = crate::stream_analyzer::analyze_xml(section0);
     let fields = crate::stream_analyzer::extract_fields(&tables);
     let json = serde_json::to_string(&fields)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(AnalysisResult { json })
+}
+
+/// HWPX 양식 분석 — adaptive table recognition trace 포함
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "analyzeFormAdaptive")]
+pub fn analyze_form_adaptive_wasm(
+    hwpx_bytes: &[u8],
+    policy_json: &str,
+) -> Result<AnalysisResult, JsError> {
+    let policy = parse_policy_json(policy_json)?;
+    let text_files = crate::zipper::extract_text_files(hwpx_bytes)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let section0 = text_files.get("Contents/section0.xml")
+        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+    let result = crate::stream_analyzer::analyze_form_adaptive(section0, Some(&policy));
+    let json = serde_json::to_string(&result)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(AnalysisResult { json })
+}
+
+/// HWPX 테이블 inspection — adaptive trace + raw grid
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "inspectTables")]
+pub fn inspect_tables_wasm(
+    hwpx_bytes: &[u8],
+    policy_json: &str,
+) -> Result<AnalysisResult, JsError> {
+    let policy = parse_policy_json(policy_json)?;
+    let text_files = crate::zipper::extract_text_files(hwpx_bytes)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let section0 = text_files.get("Contents/section0.xml")
+        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+    let result = crate::stream_analyzer::inspect_tables_adaptive(section0, Some(&policy));
+    let json = serde_json::to_string(&result)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(AnalysisResult { json })
 }
@@ -254,7 +300,7 @@ pub fn fill_form(hwpx_bytes: &[u8], patches_json: &str) -> Result<Vec<u8>, JsErr
         p["col"].as_u64().unwrap_or(0) as u32,
         p["value"].as_str().unwrap_or("").to_string(),
     )).collect();
-    let patched_xml = crate::patcher::patch_cells(section0, &patch_list)
+    let patched_xml = crate::filler::fill(section0, &patch_list)
         .map_err(|e| JsError::new(&e.to_string()))?;
     let mut modified = std::collections::HashMap::new();
     modified.insert("Contents/section0.xml".to_string(), patched_xml);
@@ -311,6 +357,24 @@ pub fn extract_data_wasm(hwpx_bytes: &[u8]) -> Result<AnalysisResult, JsError> {
     Ok(AnalysisResult { json })
 }
 
+/// HWPX 데이터 추출 — adaptive table recognition trace 포함
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "extractDataAdaptive")]
+pub fn extract_data_adaptive_wasm(
+    hwpx_bytes: &[u8],
+    policy_json: &str,
+) -> Result<AnalysisResult, JsError> {
+    let policy = parse_policy_json(policy_json)?;
+    let text_files = crate::zipper::extract_text_files(hwpx_bytes)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let section0 = text_files.get("Contents/section0.xml")
+        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+    let result = crate::extractor::extract_data_adaptive(section0, Some(&policy));
+    let json = serde_json::to_string(&result)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(AnalysisResult { json })
+}
+
 /// CSV 데이터 추출 — Firebase export 등
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "extractCsv")]
@@ -336,6 +400,23 @@ pub fn map_to_form_wasm(
             .map_err(|e| JsError::new(&format!("fields JSON error: {}", e)))?;
     let result = crate::extractor::map_extracted_to_form_detailed(&extracted, &form_fields);
     let json = serde_json::to_string(&result)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(AnalysisResult { json })
+}
+
+/// 구조 피드백으로 adaptive policy 갱신
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "updateRecognitionPolicy")]
+pub fn update_recognition_policy_wasm(
+    policy_json: &str,
+    feedback_json: &str,
+) -> Result<AnalysisResult, JsError> {
+    let policy = parse_policy_json(policy_json)?;
+    let feedbacks: Vec<crate::stream_analyzer::StructureFeedback> =
+        serde_json::from_str(feedback_json)
+            .map_err(|e| JsError::new(&format!("feedback JSON error: {}", e)))?;
+    let updated = crate::stream_analyzer::update_policy_with_feedback(&policy, &feedbacks);
+    let json = serde_json::to_string(&updated)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(AnalysisResult { json })
 }
