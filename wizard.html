@@ -498,7 +498,7 @@
         if (!fp) continue;
         db.run(`INSERT OR IGNORE INTO forms (fingerprint, row_count, col_count, header_tokens, first_seen_at, last_used_at, use_count)
                 VALUES (?, ?, ?, ?, ?, ?, 0)`,
-          [fp, t.fingerprint.rowCount, t.fingerprint.colCount, JSON.stringify(t.fingerprint.headerTokens), Date.now(), Date.now()]);
+          [fp, t.fingerprint?.rowCount ?? 0, t.fingerprint?.colCount ?? 0, JSON.stringify(t.fingerprint?.headerTokens || []), Date.now(), Date.now()]);
         db.run("UPDATE forms SET last_used_at = ?, use_count = use_count + 1 WHERE fingerprint = ?", [Date.now(), fp]);
       }
     }
@@ -510,12 +510,12 @@
         const fp = tableTrace?.fingerprint?.family;
         if (!fp) continue;
         const addr = `${f.row}:${f.col}`;
-        const canon = matchCanonical(f.label);
+        const canon = matchCanonical(f.label) || null;
         const existing = db.exec("SELECT id FROM form_fields WHERE form_fingerprint=? AND cell_addr=?", [fp, addr]);
         if (!existing.length || !existing[0].values.length) {
           db.run(`INSERT INTO form_fields (form_fingerprint, cell_addr, label_text, label_hash, canonical_field, cell_role, confidence, updated_at)
                   VALUES (?, ?, ?, ?, ?, 'label', ?, ?)`,
-            [fp, addr, f.label, normalizeLabel(f.label), canon, f.confidence || 0.5, Date.now()]);
+            [fp, addr, f.label || '', normalizeLabel(f.label || ''), canon, f.confidence ?? 0.5, Date.now()]);
         }
       }
     }
@@ -1086,10 +1086,12 @@
         S.sourceData = parsed.fields;
         S.sourceInspection = { tables: parsed.tables, trace: parsed.trace };
         S.structureEdits.source = {};
-        // DB 등록: 양식 + 필드
-        registerFormFromTrace(parsed.trace);
-        registerFieldsFromAnalysis(parsed.fields, parsed.trace);
-        await saveDbToIndexedDB();
+        // DB 등록: 양식 + 필드 (비동기, 실패해도 무시)
+        try {
+          if (parsed.trace?.length) registerFormFromTrace(parsed.trace);
+          if (parsed.fields?.length && parsed.trace?.length) registerFieldsFromAnalysis(parsed.fields, parsed.trace);
+          await saveDbToIndexedDB();
+        } catch (dbErr) { console.warn('DB registration failed:', dbErr); }
         document.getElementById('src-hwpx-box').classList.add('has-file');
         renderSourcePreview();
         renderStructurePanel('source');
@@ -1140,10 +1142,12 @@
         S.formFields = parsed.fields;
         S.templateInspection = { tables: parsed.tables, trace: parsed.trace };
         S.structureEdits.template = {};
-        // DB 등록: 양식 + 필드
-        registerFormFromTrace(parsed.trace);
-        registerFieldsFromAnalysis(parsed.fields, parsed.trace);
-        await saveDbToIndexedDB();
+        // DB 등록: 양식 + 필드 (비동기, 실패해도 무시)
+        try {
+          if (parsed.trace?.length) registerFormFromTrace(parsed.trace);
+          if (parsed.fields?.length && parsed.trace?.length) registerFieldsFromAnalysis(parsed.fields, parsed.trace);
+          await saveDbToIndexedDB();
+        } catch (dbErr) { console.warn('DB registration failed:', dbErr); }
         document.getElementById('tpl-box').classList.add('has-file');
         renderTemplatePreview();
         renderStructurePanel('template');
