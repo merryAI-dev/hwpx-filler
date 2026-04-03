@@ -1,0 +1,15 @@
+{
+  "name": "hwpx-policy-hub",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create hwpx-policies",
+    "db:migrate": "wrangler d1 execute hwpx-policies --file=schema.sql",
+    "db:migrate:local": "wrangler d1 execute hwpx-policies --local --file=schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

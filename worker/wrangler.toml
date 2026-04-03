@@ -1,0 +1,11 @@
+name = "hwpx-policy-hub"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hwpx-policies"
+database_id = "" # wrangler d1 create hwpx-policies 후 채울 것
+
+[vars]
+CORS_ORIGIN = "*"

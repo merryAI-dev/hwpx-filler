@@ -534,22 +534,35 @@
       meta.textContent = `양식 ${stats.forms}개 · 필드 ${stats.fields}개 · 피드백 ${stats.feedback + stats.events}건${extra ? ` · ${extra}` : ''}`;
     }
 
-    // ── Community Policy: fetch + merge on startup ──
-    const POLICY_BASE_URL = (() => {
+    // ── Community Policy Hub (Cloudflare Worker + D1) ──
+    // Worker URL: update after `wrangler deploy`
+    const POLICY_HUB_URL = 'https://hwpx-policy-hub.merryai-dev.workers.dev';
+    // Fallback: github.io static (works without Worker)
+    const POLICY_STATIC_URL = (() => {
       const loc = window.location;
       if (loc.hostname.endsWith('github.io')) return `${loc.origin}${loc.pathname.replace(/\/[^/]*$/, '')}/policies`;
-      return './policies'; // local dev
+      return './policies';
     })();
 
     async function fetchCommunityPolicies() {
+      // Try Worker API first, fallback to static JSON
       try {
-        const resp = await fetch(`${POLICY_BASE_URL}/index.json`, { cache: 'no-cache' });
+        const resp = await fetch(`${POLICY_HUB_URL}/api/policies`, { cache: 'no-cache' });
+        if (resp.ok) {
+          const data = await resp.json();
+          // Worker returns flat structure, wrap for mergeCommunityPolicies
+          return { policies: [{ _data: data }] };
+        }
+      } catch {}
+      // Fallback: static github.io
+      try {
+        const resp = await fetch(`${POLICY_STATIC_URL}/index.json`, { cache: 'no-cache' });
         if (!resp.ok) return null;
         const index = await resp.json();
         if (!index.policies?.length) return index;
         for (const entry of index.policies) {
           try {
-            const pResp = await fetch(`${POLICY_BASE_URL}/${entry.file}`, { cache: 'no-cache' });
+            const pResp = await fetch(`${POLICY_STATIC_URL}/${entry.file}`, { cache: 'no-cache' });
             if (!pResp.ok) continue;
             entry._data = await pResp.json();
           } catch {}
@@ -656,22 +669,37 @@
       });
     };
 
-    window.exportCommunityJson = () => {
+    window.exportCommunityJson = async () => {
       const payload = exportCommunityPolicy();
       if (!payload.forms.length && !payload.fields.length) {
         showStatus('learning-status', 'error', '공유할 학습 데이터가 없습니다. 양식을 먼저 분석하세요.');
         return;
       }
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `hwpx-community-policy-${new Date().toISOString().slice(0,10)}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      showStatus('learning-status', 'success',
-        `정책 공유용 JSON 내보내기 완료 (양식 ${payload.forms.length}개, 필드 ${payload.fields.length}개). ` +
-        `이 파일을 policies/ 디렉토리에 PR로 제출하면 다른 사용자와 공유됩니다.`);
+      showStatus('learning-status', 'info', '커뮤니티에 정책 공유 중...');
+      try {
+        const resp = await fetch(`${POLICY_HUB_URL}/api/contribute`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const result = await resp.json();
+        if (resp.ok) {
+          showStatus('learning-status', 'success', result.message || '정책이 커뮤니티에 공유되었습니다!');
+        } else {
+          throw new Error(result.error || `HTTP ${resp.status}`);
+        }
+      } catch (e) {
+        // Fallback: download JSON file
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `hwpx-community-policy-${new Date().toISOString().slice(0,10)}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showStatus('learning-status', 'success',
+          `서버 연결 실패 (${e.message}). JSON 파일로 내보냈습니다.`);
+      }
     };
 
     window.exportLearningData = async () => {
