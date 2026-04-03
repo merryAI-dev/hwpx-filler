@@ -114,6 +114,7 @@
       <div class="meta" id="learning-meta">표 인식 학습 데이터 로딩 중...</div>
       <button class="btn btn-outline" onclick="exportLearningData()" style="padding:6px 14px;font-size:13px">학습 내보내기</button>
       <button class="btn btn-outline" onclick="exportPolicyDb()" style="padding:6px 14px;font-size:13px">DB 내보내기</button>
+      <button class="btn btn-primary" onclick="exportCommunityJson()" style="padding:6px 14px;font-size:13px">정책 공유</button>
       <label class="btn btn-outline" style="padding:6px 14px;font-size:13px;display:inline-flex;align-items:center;cursor:pointer">
         학습 가져오기
         <input type="file" accept=".json,.db" style="display:none" onchange="importLearningData(this)">
@@ -533,8 +534,117 @@
       meta.textContent = `양식 ${stats.forms}개 · 필드 ${stats.fields}개 · 피드백 ${stats.feedback + stats.events}건${extra ? ` · ${extra}` : ''}`;
     }
 
+    // ── Community Policy: fetch + merge on startup ──
+    const POLICY_BASE_URL = (() => {
+      const loc = window.location;
+      if (loc.hostname.endsWith('github.io')) return `${loc.origin}${loc.pathname.replace(/\/[^/]*$/, '')}/policies`;
+      return './policies'; // local dev
+    })();
+
+    async function fetchCommunityPolicies() {
+      try {
+        const resp = await fetch(`${POLICY_BASE_URL}/index.json`, { cache: 'no-cache' });
+        if (!resp.ok) return null;
+        const index = await resp.json();
+        if (!index.policies?.length) return index;
+        for (const entry of index.policies) {
+          try {
+            const pResp = await fetch(`${POLICY_BASE_URL}/${entry.file}`, { cache: 'no-cache' });
+            if (!pResp.ok) continue;
+            entry._data = await pResp.json();
+          } catch {}
+        }
+        return index;
+      } catch { return null; }
+    }
+
+    function mergeCommunityPolicies(index) {
+      if (!index?.policies?.length) return 0;
+      let merged = 0;
+      for (const entry of index.policies) {
+        const data = entry._data;
+        if (!data) continue;
+        // Merge forms
+        if (data.forms) {
+          for (const form of data.forms) {
+            db.run(`INSERT OR IGNORE INTO forms (fingerprint, row_count, col_count, header_tokens, first_seen_at, last_used_at, use_count)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)`,
+              [form.fingerprint, form.rowCount, form.colCount, JSON.stringify(form.headerTokens || []), Date.now(), Date.now()]);
+          }
+        }
+        // Merge form_fields
+        if (data.fields) {
+          for (const f of data.fields) {
+            const existing = db.exec("SELECT confidence FROM form_fields WHERE form_fingerprint=? AND cell_addr=?", [f.formFingerprint, f.cellAddr]);
+            const localConf = existing[0]?.values[0]?.[0] ?? -1;
+            if (f.confidence > localConf) {
+              if (localConf < 0) {
+                db.run(`INSERT INTO form_fields (form_fingerprint, cell_addr, label_text, label_hash, canonical_field, cell_role, confidence, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [f.formFingerprint, f.cellAddr, f.labelText, f.labelHash, f.canonicalField, f.cellRole || 'label', f.confidence, Date.now()]);
+              } else {
+                db.run("UPDATE form_fields SET confidence=?, canonical_field=?, updated_at=? WHERE form_fingerprint=? AND cell_addr=?",
+                  [f.confidence, f.canonicalField, Date.now(), f.formFingerprint, f.cellAddr]);
+              }
+              merged++;
+            }
+          }
+        }
+        // Merge recognition policy biases
+        if (data.policy && Object.keys(data.policy).length > 0) {
+          const local = S.recognitionPolicy || {};
+          for (const key of ['tableKindBiases', 'rowKindBiases', 'cellRoleBiases']) {
+            if (!data.policy[key]) continue;
+            if (!local[key]) local[key] = {};
+            for (const [family, weights] of Object.entries(data.policy[key])) {
+              if (!local[key][family]) { local[key][family] = weights; merged++; }
+            }
+          }
+          S.recognitionPolicy = local;
+          saveRecognitionPolicy(local);
+        }
+      }
+      return merged;
+    }
+
+    function exportCommunityPolicy() {
+      const forms = db.exec("SELECT fingerprint, row_count, col_count, header_tokens FROM forms");
+      const fields = db.exec("SELECT form_fingerprint, cell_addr, label_text, label_hash, canonical_field, cell_role, confidence FROM form_fields WHERE confidence >= 0.6");
+      const policy = S.recognitionPolicy || {};
+      // Strip memory (contains positional data that could hint at PII patterns)
+      const safePolicy = {};
+      for (const key of ['tableKindBiases', 'rowKindBiases', 'cellRoleBiases']) {
+        if (policy[key]) safePolicy[key] = policy[key];
+      }
+      const payload = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        contributor: 'anonymous',
+        forms: (forms[0]?.values || []).map(r => ({
+          fingerprint: r[0], rowCount: r[1], colCount: r[2], headerTokens: JSON.parse(r[3] || '[]'),
+        })),
+        fields: (fields[0]?.values || []).map(r => ({
+          formFingerprint: r[0], cellAddr: r[1], labelText: r[2], labelHash: r[3], canonicalField: r[4], cellRole: r[5], confidence: r[6],
+        })),
+        policy: safePolicy,
+      };
+      return payload;
+    }
+
     // ── Policy init ──
     S.recognitionPolicy = loadRecognitionPolicySync();
+
+    // Fetch community policies in background (non-blocking)
+    fetchCommunityPolicies().then(index => {
+      const merged = mergeCommunityPolicies(index);
+      if (merged > 0) {
+        S.recognitionPolicy = loadRecognitionPolicySync();
+        saveDbToIndexedDB();
+        renderLearningMeta(`커뮤니티 ${merged}건 동기화`);
+      } else {
+        renderLearningMeta();
+      }
+    }).catch(() => renderLearningMeta());
     renderLearningMeta();
 
     // ── Expose to onclick ──
@@ -544,6 +654,24 @@
       ['hwpx','csv','json'].forEach(t => {
         document.getElementById(`tab-${t}`).style.display = t === tab ? 'block' : 'none';
       });
+    };
+
+    window.exportCommunityJson = () => {
+      const payload = exportCommunityPolicy();
+      if (!payload.forms.length && !payload.fields.length) {
+        showStatus('learning-status', 'error', '공유할 학습 데이터가 없습니다. 양식을 먼저 분석하세요.');
+        return;
+      }
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `hwpx-community-policy-${new Date().toISOString().slice(0,10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showStatus('learning-status', 'success',
+        `정책 공유용 JSON 내보내기 완료 (양식 ${payload.forms.length}개, 필드 ${payload.fields.length}개). ` +
+        `이 파일을 policies/ 디렉토리에 PR로 제출하면 다른 사용자와 공유됩니다.`);
     };
 
     window.exportLearningData = async () => {
