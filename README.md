@@ -32,7 +32,35 @@
 
 ---
 
-## 이번 구현에서 추가된 것
+## 최근 변경 (v0.2)
+
+### 다중 섹션 지원
+
+HWPX 문서의 `Contents/section0.xml`, `section1.xml`, ... 모든 섹션을 자동 순회합니다. 13개 WASM export 전부 다중 섹션을 지원하며, `table_index`는 전체 문서에서 글로벌하게 유니크합니다. wizard.html은 변경 없이 그대로 동작합니다.
+
+### 통합 테스트 스위트
+
+`tests/integration.rs`에 16개 테스트가 추가되었습니다. 실제 HWPX 서식 4개(서식5, 코이카, 테스트, 최악의서식)를 fixture로 포함하며, cross-form 매핑(서식5→코이카 17/32 필드)과 행 클론(10→12행) 등 end-to-end 검증을 수행합니다.
+
+### 채움 결과 HTML 미리보기
+
+`renderToHtml` WASM export가 추가되었습니다. 채워진 HWPX의 테이블 구조를 HTML `<table>`로 렌더링합니다. wizard.html의 Step 4에서 다운로드 전에 결과를 확인할 수 있습니다.
+
+### 에러 한글화
+
+Anthropic API 호출 시 HTTP 상태 코드별 한글 에러 메시지를 반환합니다 (401 키 오류, 429 한도 초과, 500 서버 오류, 네트워크 실패). 섹션 누락 등 WASM 에러도 한글화되었습니다.
+
+### 적응형 테이블 인식 + SQLite WASM 학습
+
+표 구조를 자동 분류하고, 사용자 피드백으로 인식 정확도를 개선합니다. 학습 데이터는 SQLite WASM(sql.js + IndexedDB)에 저장되어 세션 간 지속됩니다.
+
+### 커뮤니티 정책 허브
+
+Cloudflare Worker + D1으로 PII 없는 구조 메타데이터를 공유합니다. 다른 사용자의 학습 결과를 시작 시 자동 동기화합니다.
+
+---
+
+## 기능 상세
 
 초기 수준의 "빈 양식 분석 + 단순 셀 패치"를 넘어서, 현재 Rust 구현에는 아래 기능이 추가되어 있습니다.
 
@@ -154,21 +182,31 @@ use hwpx_filler::{extractor, patcher, stream_analyzer, zipper};
 
 let bytes = std::fs::read("form.hwpx")?;
 let text_files = zipper::extract_text_files(&bytes)?;
-let section0 = &text_files["Contents/section0.xml"];
 
-// 빈 양식 분석
-let tables = stream_analyzer::analyze_xml(section0);
-let fields = stream_analyzer::extract_fields(&tables);
+// 모든 섹션 순회 (다중 섹션 자동 지원)
+let mut sections: Vec<(&str, &str)> = text_files.iter()
+    .filter(|(n, _)| n.starts_with("Contents/section") && n.ends_with(".xml"))
+    .map(|(n, c)| (n.as_str(), c.as_str()))
+    .collect();
+sections.sort_by_key(|(n, _)| *n);
 
-// 채워진 양식에서 데이터 추출
-let extracted = extractor::extract_data(section0);
+let mut all_fields = Vec::new();
+let mut table_offset = 0;
+for (_, xml) in &sections {
+    let tables = stream_analyzer::analyze_xml(xml);
+    let mut fields = stream_analyzer::extract_fields(&tables);
+    for f in &mut fields { f.table_index += table_offset; }
+    table_offset += tables.len();
+    all_fields.extend(fields);
+}
 
-// 셀 패치 적용
+// 셀 패치 적용 (첫 번째 섹션 예시)
+let (section_name, section_xml) = &sections[0];
 let patches = vec![(0usize, 0u32, 1u32, "김철수".to_string())];
-let patched_xml = patcher::patch_cells(section0, &patches)?;
+let patched_xml = patcher::patch_cells(section_xml, &patches)?;
 
 let mut modified = std::collections::HashMap::new();
-modified.insert("Contents/section0.xml".to_string(), patched_xml);
+modified.insert(section_name.to_string(), patched_xml);
 let output = zipper::patch_hwpx(&bytes, &modified)?;
 ```
 
@@ -211,16 +249,20 @@ cargo run --bin hwpx-fill -- template.hwpx output.hwpx
 ```text
 hwpx-filler/
 ├── src/
-│   ├── stream_analyzer.rs  # streaming XML 파서, 라벨/데이터 분류
+│   ├── stream_analyzer.rs  # streaming XML 파서, 적응형 인식, 라벨/데이터 분류
 │   ├── extractor.rs        # 채워진 HWPX/CSV에서 데이터 추출
-│   ├── patcher.rs          # 셀 패치, 행 복제
+│   ├── patcher.rs          # 셀 패치, 행 복제, 스킵 감지
 │   ├── llm_format.rs       # 테이블을 LLM 친화 텍스트로 변환
 │   ├── zipper.rs           # 원본 ZIP 유지형 패치
 │   ├── filler.rs           # 분석/채움/검증 통합 API
 │   ├── validate.rs         # 구조 검증
 │   ├── model.rs            # serde 모델
-│   └── wasm.rs             # 브라우저용 WASM export + 프라이버시 경계
-├── wizard.html             # 브라우저 UI
+│   └── wasm.rs             # 브라우저용 18개 WASM export + 다중 섹션 + 프라이버시
+├── tests/
+│   ├── integration.rs      # 16개 통합 테스트 (synthetic + real fixtures)
+│   └── fixtures/           # 실제 HWPX 서식 (서식5, 코이카, 최악의서식 등)
+├── worker/                 # Cloudflare Worker + D1 커뮤니티 정책 허브
+├── wizard.html             # 브라우저 UI (4-step wizard + HTML 미리보기)
 ├── demo.html               # 간단한 데모 페이지
 └── examples/
 ```
@@ -316,23 +358,28 @@ CLI와 WASM 계층이 이 모듈을 통해 공통 흐름을 사용할 수 있게
 
 ## 브라우저/WASM API
 
-현재 브라우저용 export는 13개입니다.
+현재 브라우저용 export는 18개입니다. 모든 함수가 다중 섹션을 자동 지원합니다.
 
 | 함수 | 설명 |
 |------|------|
 | `setApiKey(key)` | API 키를 WASM 메모리에만 저장 |
 | `clearApiKey()` | 메모리에서 API 키 제거 |
 | `hasApiKey()` | API 키 존재 여부만 확인 |
-| `callAnthropic(body)` | Anthropic API를 Rust fetch로 직접 호출 |
+| `callAnthropic(body)` | Anthropic API를 Rust fetch로 직접 호출 (한글 에러 메시지) |
 | `extractLabelsOnly(bytes)` | 값 없이 라벨 목록만 추출 |
 | `applyLabelMappings(src, tpl, pairs)` | 라벨 쌍을 이용해 WASM 내부에서 최종 채움 |
 | `analyzeForm(bytes)` | 빈 양식 분석 |
+| `analyzeFormAdaptive(bytes, policy)` | 적응형 테이블 인식 + trace |
+| `inspectTables(bytes, policy)` | 테이블 구조 inspection |
 | `fillForm(bytes, patches)` | 셀 패치 적용 |
 | `cloneRows(bytes, clones)` | 행 복제 |
 | `formatForLLM(bytes)` | LLM 입력용 테이블 포맷 생성 |
+| `renderToHtml(bytes)` | 테이블 구조를 HTML로 렌더링 (미리보기) |
 | `extractData(bytes)` | 채워진 HWPX에서 데이터 추출 |
+| `extractDataAdaptive(bytes, policy)` | 적응형 데이터 추출 + trace |
 | `extractCsv(csv)` | CSV를 추출 결과 형태로 변환 |
 | `mapToForm(extracted, fields)` | 규칙 기반 매핑 및 상세 결과 반환 |
+| `updateRecognitionPolicy(policy, feedback)` | 구조 피드백으로 인식 정책 갱신 |
 
 ---
 
@@ -416,7 +463,8 @@ cargo install wasm-pack
 테스트:
 
 ```bash
-cargo test
+cargo test                    # unit 14개 + integration 16개 = 30개
+cargo test --test integration # 통합 테스트만
 ```
 
 브라우저용 WASM 빌드:
@@ -464,6 +512,7 @@ wasm-pack build --target bundler --release -- --features wasm
 | 서식 3-5 류 균일 스타일 표 | ✅ | ✅ | ✅ | ✅ |
 | CSV/Firebase export 입력 | - | ✅ | ✅ | - |
 | 다중 테이블 문서 | ✅ | ✅ | ✅ | 경우에 따라 |
+| 다중 섹션 문서 (section0~N) | ✅ | ✅ | ✅ | ✅ |
 
 ---
 
@@ -473,6 +522,7 @@ wasm-pack build --target bundler --release -- --features wasm
 - 체크박스, 라디오 버튼 같은 폼 컨트롤은 아직 텍스트처럼 완전하게 다루지 않습니다.
 - 암호화된 HWPX는 지원하지 않습니다.
 - CLI는 아직 범용 소스-대상 매핑 도구라기보다 디버그/데모 성격이 강합니다.
+- 빈 `<hp:t></hp:t>` 셀에 연속 패치 시 바이트 오프셋 밀림이 발생할 수 있습니다.
 
 ---
 
