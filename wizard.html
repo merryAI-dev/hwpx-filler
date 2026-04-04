@@ -283,6 +283,13 @@
       <div id="single-result" class="done-card">
         <div class="done-icon">&#10003;</div>
         <div id="done-summary"></div>
+        <div id="preview-section" style="display:none;margin-top:20px;text-align:left">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+            <h3 style="font-size:15px;font-weight:600;margin:0">채움 결과 미리보기</h3>
+            <button class="btn btn-outline" onclick="togglePreview()" style="padding:4px 12px;font-size:12px" id="btn-toggle-preview">접기</button>
+          </div>
+          <div id="preview-content" style="max-height:400px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px;padding:12px"></div>
+        </div>
         <div class="btn-row" style="justify-content:center;margin-top:24px">
           <button class="btn btn-secondary" onclick="goStep(1)">새로 시작</button>
         </div>
@@ -298,6 +305,8 @@
       // Privacy-preserving exports (2세대)
       setApiKey, clearApiKey, hasApiKey, callAnthropic,
       extractLabelsOnly, applyLabelMappings, updateRecognitionPolicy,
+      // 미리보기 (3세대)
+      renderToHtml,
     } from './pkg/hwpx_filler.js';
 
     // ── State ──
@@ -1171,6 +1180,18 @@
       if (S.editedMappings?.length) renderMappingTable();
     };
 
+    window.togglePreview = () => {
+      const content = document.getElementById('preview-content');
+      const btn = document.getElementById('btn-toggle-preview');
+      if (content.style.display === 'none') {
+        content.style.display = 'block';
+        btn.textContent = '접기';
+      } else {
+        content.style.display = 'none';
+        btn.textContent = '펼치기';
+      }
+    };
+
     window.clearApiKeyUi = () => {
       clearApiKey();
       renderAiKeyStatus();
@@ -1495,6 +1516,18 @@ ${templateText}`;
         document.getElementById('done-summary').innerHTML =
           `<p style="font-size:18px;font-weight:600;margin-bottom:8px">${filled}개 필드 채움 완료</p>` +
           `<p style="color:#64748b">${skipped > 0 ? skipped + '개 필드 미매핑 (건너뜀)' : '모든 필드 매핑됨'}</p>`;
+
+        // 채움 결과 미리보기 렌더링
+        try {
+          const previewHtml = renderToHtml(new Uint8Array(output));
+          if (previewHtml && previewHtml.trim()) {
+            document.getElementById('preview-content').innerHTML = previewHtml;
+            document.getElementById('preview-section').style.display = 'block';
+          }
+        } catch (previewErr) {
+          console.warn('미리보기 렌더링 실패:', previewErr);
+        }
+
         await recordMappingFeedback(S.editedMappings, 'fill_success');
         await recordTableOutcome(touchedTables, 'fill_success');
       } catch (e) {

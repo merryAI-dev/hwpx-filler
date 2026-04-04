@@ -214,6 +214,25 @@ pub fn patch_cells(
     Ok(result)
 }
 
+/// 여러 셀을 패치하면서 스킵된 패치 정보를 반환
+/// 반환: (패치된 XML, 스킵된 패치 목록)
+pub fn patch_cells_with_report(
+    xml: &str,
+    patches: &[(usize, u32, u32, String)],
+) -> Result<(String, Vec<(usize, u32, u32)>)> {
+    let mut result = xml.to_string();
+    let mut skipped = Vec::new();
+    for (table_index, row, col, text) in patches {
+        let before_len = result.len();
+        result = patch_cell_text(&result, *table_index, *row, *col, text)?;
+        // patch_cell_text returns original if cell not found, so length is unchanged
+        if result.len() == before_len && !text.is_empty() {
+            skipped.push((*table_index, *row, *col));
+        }
+    }
+    Ok((result, skipped))
+}
+
 /// 행 클론 — template row를 N번 복제하고 rowAddr 재계산
 ///
 /// 전략: quick-xml로 바이트 위치만 찾고, 실제 수정은 문자열 수준.

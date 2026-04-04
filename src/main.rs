@@ -19,10 +19,22 @@ fn main() {
     println!("1. Reading {}...", template_path);
     let hwpx_bytes = fs::read(template_path).expect("파일 읽기 실패");
     let text_files = hwpx_filler::zipper::extract_text_files(&hwpx_bytes).expect("ZIP 실패");
-    let section0 = text_files.get("Contents/section0.xml").expect("section0.xml 없음");
 
-    // 2. Analyze (filler 통합 API)
+    // 모든 섹션 파일 탐색
+    let mut section_names: Vec<&str> = text_files.keys()
+        .filter(|name| name.starts_with("Contents/section") && name.ends_with(".xml"))
+        .map(|s| s.as_str())
+        .collect();
+    section_names.sort();
+    if section_names.is_empty() {
+        eprintln!("Error: HWPX에 섹션 파일이 없습니다");
+        std::process::exit(1);
+    }
+    println!("   Found {} section(s): {:?}", section_names.len(), section_names);
+
+    // 2. Analyze (첫 번째 섹션 기준 — CLI 데모용)
     println!("2. Analyzing...");
+    let section0 = text_files.get(section_names[0]).expect("section not found");
     let result = hwpx_filler::filler::analyze(section0);
 
     for table in &result.tables {
@@ -80,7 +92,7 @@ fn main() {
         // 5. Repack
         println!("\n5. Repacking...");
         let mut modified = std::collections::HashMap::new();
-        modified.insert("Contents/section0.xml".to_string(), patched);
+        modified.insert(section_names[0].to_string(), patched);
         let out = hwpx_filler::zipper::patch_hwpx(&hwpx_bytes, &modified).expect("ZIP 실패");
         fs::write(output, &out).expect("쓰기 실패");
         println!("   ✓ {} ({} bytes)", output, out.len());

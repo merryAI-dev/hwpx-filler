@@ -16,7 +16,7 @@ pub enum FillerError {
     #[error("IO 에러: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("section0.xml을 찾을 수 없습니다")]
+    #[error("HWPX에 섹션 파일이 없습니다 (Contents/sectionN.xml)")]
     NoSection,
 
     #[error("테이블 {table}의 셀 ({row}, {col})을 찾을 수 없습니다")]

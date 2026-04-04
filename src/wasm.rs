@@ -94,19 +94,38 @@ pub async fn call_anthropic(body_json: &str) -> Result<String, JsError> {
         .ok_or_else(|| JsError::new("window 없음"))?;
     let resp_val = JsFuture::from(window.fetch_with_request(&request))
         .await
-        .map_err(|e| JsError::new(&format!("fetch 실패: {:?}", e)))?;
+        .map_err(|e| JsError::new(&format!("네트워크 연결 실패: 인터넷 연결을 확인해주세요. ({:?})", e)))?;
 
     let resp: Response = resp_val.dyn_into()
         .map_err(|_| JsError::new("Response 타입 캐스트 실패"))?;
 
+    let status = resp.status();
+
     let text_promise = resp.text()
-        .map_err(|e| JsError::new(&format!("resp.text(): {:?}", e)))?;
+        .map_err(|e| JsError::new(&format!("응답 읽기 실패: {:?}", e)))?;
     let text_val = JsFuture::from(text_promise)
         .await
-        .map_err(|e| JsError::new(&format!("text await: {:?}", e)))?;
+        .map_err(|e| JsError::new(&format!("응답 대기 실패: {:?}", e)))?;
 
-    text_val.as_string()
-        .ok_or_else(|| JsError::new("응답이 문자열이 아님"))
+    let body = text_val.as_string()
+        .ok_or_else(|| JsError::new("응답이 문자열이 아닙니다"))?;
+
+    // HTTP 상태 코드별 한글 에러 메시지
+    match status {
+        200..=299 => Ok(body),
+        401 => Err(JsError::new("API 키가 유효하지 않습니다. 키를 확인해주세요.")),
+        429 => Err(JsError::new("API 요청 한도를 초과했습니다. 잠시 후 다시 시도해주세요.")),
+        400 => {
+            // 모델 거부 또는 잘못된 요청 — 응답 본문에서 힌트 추출
+            if body.contains("refusal") || body.contains("content_policy") {
+                Err(JsError::new("AI가 이 요청을 처리할 수 없습니다. 입력 내용을 확인해주세요."))
+            } else {
+                Err(JsError::new(&format!("잘못된 요청입니다 (400): {}", &body[..body.len().min(200)])))
+            }
+        }
+        500..=599 => Err(JsError::new(&format!("Anthropic 서버 오류입니다 ({}). 잠시 후 다시 시도해주세요.", status))),
+        _ => Err(JsError::new(&format!("예상치 못한 응답 (HTTP {}): {}", status, &body[..body.len().min(200)]))),
+    }
 }
 
 // ── Privacy-preserving 매핑 ─────────────────────────────────────────────────
@@ -115,19 +134,23 @@ pub async fn call_anthropic(body_json: &str) -> Result<String, JsError> {
 ///
 /// LLM에 전달하기 위한 함수. 값(PII)은 절대 반환하지 않음.
 /// 반환: JSON string array — ["성 명", "직 책", "소 속", ...]
+/// 다중 섹션 지원
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "extractLabelsOnly")]
 pub fn extract_labels_only(hwpx_bytes: &[u8]) -> Result<String, JsError> {
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+    let sections = find_section_xmls(&text_files)?;
 
-    let fields = crate::extractor::extract_data(section0);
-    let labels: Vec<&str> = fields.iter()
-        .map(|f| f.raw_label.as_str())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let mut labels: Vec<String> = Vec::new();
+    for (_, xml) in &sections {
+        let fields = crate::extractor::extract_data(xml);
+        for f in fields {
+            if !f.raw_label.is_empty() {
+                labels.push(f.raw_label);
+            }
+        }
+    }
 
     serde_json::to_string(&labels)
         .map_err(|e| JsError::new(&e.to_string()))
@@ -143,6 +166,7 @@ pub fn extract_labels_only(hwpx_bytes: &[u8]) -> Result<String, JsError> {
 ///
 /// JS가 받는 것: 완성된 HWPX bytes
 /// JS가 볼 수 없는 것: 실제 값, 셀 좌표 계산 과정
+/// 다중 섹션 지원: source/template 모두 모든 섹션 순회
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "applyLabelMappings")]
 pub fn apply_label_mappings(
@@ -152,54 +176,68 @@ pub fn apply_label_mappings(
 ) -> Result<Vec<u8>, JsError> {
     use std::collections::HashMap;
 
-    // label 정규화 — 공백 제거 후 소문자
     fn norm(s: &str) -> String {
         s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase()
     }
 
-    // 1. 소스: label → value 맵 (WASM 내부에서만 사용)
+    // 1. 소스: 모든 섹션에서 label → value 맵 수집
     let src_files = crate::zipper::extract_text_files(source_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let src_xml = src_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("source section0.xml not found"))?;
-    let src_fields = crate::extractor::extract_data(src_xml);
-    let src_map: HashMap<String, String> = src_fields.iter()
-        .map(|f| (norm(&f.raw_label), f.value.clone()))
-        .collect();
+    let src_sections = find_section_xmls(&src_files)?;
+    let mut src_map: HashMap<String, String> = HashMap::new();
+    for (_, xml) in &src_sections {
+        let fields = crate::extractor::extract_data(xml);
+        for f in &fields {
+            src_map.entry(norm(&f.raw_label)).or_insert_with(|| f.value.clone());
+        }
+    }
 
-    // 2. 대상: label → (tableIndex, row, col) 맵
+    // 2. 대상: 모든 섹션에서 label → (section_name, local_table_index, row, col) 맵
     let tpl_files = crate::zipper::extract_text_files(template_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let tpl_xml = tpl_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("template section0.xml not found"))?;
-    let tpl_tables = crate::stream_analyzer::analyze_xml(tpl_xml);
-    let tpl_fields = crate::stream_analyzer::extract_fields(&tpl_tables);
-    let tpl_map: HashMap<String, (usize, u32, u32)> = tpl_fields.iter()
-        .map(|f| (norm(&f.label), (f.table_index, f.row, f.col)))
-        .collect();
+    let tpl_sections = find_section_xmls(&tpl_files)?;
+
+    // (normalized_label) → (section_name, local_table_index, row, col)
+    let mut tpl_map: HashMap<String, (String, usize, u32, u32)> = HashMap::new();
+    for (section_name, xml) in &tpl_sections {
+        let tables = crate::stream_analyzer::analyze_xml(xml);
+        let fields = crate::stream_analyzer::extract_fields(&tables);
+        for f in &fields {
+            tpl_map.entry(norm(&f.label)).or_insert_with(|| {
+                (section_name.to_string(), f.table_index, f.row, f.col)
+            });
+        }
+    }
 
     // 3. LLM 라벨 쌍 파싱
     let pairs: Vec<serde_json::Value> = serde_json::from_str(label_pairs_json)
         .map_err(|e| JsError::new(&format!("label_pairs JSON 파싱 실패: {}", e)))?;
 
-    // 4. 패치 리스트 생성 — 값 조회 + 좌표 조회를 여기서 완결
-    let patch_list: Vec<(usize, u32, u32, String)> = pairs.iter()
-        .filter_map(|p| {
-            let src_lbl = norm(p["sourceLabel"].as_str()?);
-            let tgt_lbl = norm(p["targetLabel"].as_str()?);
-            let value = src_map.get(&src_lbl)?.clone();
-            let &(table_idx, row, col) = tpl_map.get(&tgt_lbl)?;
-            if value.is_empty() { return None; }
-            Some((table_idx, row, col, value))
-        })
-        .collect();
+    // 4. 섹션별로 패치 그룹핑
+    let mut section_patches: HashMap<String, Vec<(usize, u32, u32, String)>> = HashMap::new();
+    for p in &pairs {
+        let src_lbl = match p["sourceLabel"].as_str() { Some(s) => norm(s), None => continue };
+        let tgt_lbl = match p["targetLabel"].as_str() { Some(s) => norm(s), None => continue };
+        let value = match src_map.get(&src_lbl) { Some(v) if !v.is_empty() => v.clone(), _ => continue };
+        let (section_name, table_idx, row, col) = match tpl_map.get(&tgt_lbl) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        section_patches
+            .entry(section_name)
+            .or_default()
+            .push((table_idx, row, col, value));
+    }
 
-    // 5. 패치 적용 + ZIP 재조립
-    let patched_xml = crate::filler::fill(tpl_xml, &patch_list)
-        .map_err(|e| JsError::new(&e.to_string()))?;
-
-    let mut modified = std::collections::HashMap::new();
-    modified.insert("Contents/section0.xml".to_string(), patched_xml);
+    // 5. 각 섹션 독립 패치 + ZIP 재조립
+    let mut modified = HashMap::new();
+    for (section_name, patches) in &section_patches {
+        let xml = tpl_files.get(section_name)
+            .ok_or_else(|| JsError::new(&format!("{} not found", section_name)))?;
+        let patched_xml = crate::filler::fill(xml, patches)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        modified.insert(section_name.clone(), patched_xml);
+    }
 
     crate::zipper::patch_hwpx(template_bytes, &modified)
         .map_err(|e| JsError::new(&e.to_string()))
@@ -233,22 +271,89 @@ fn parse_policy_json(policy_json: &str) -> Result<crate::stream_analyzer::Recogn
     }
 }
 
+// ── 다중 섹션 헬퍼 ─────────────────────────────────────────────────────────
+//
+// HWPX 문서는 Contents/section0.xml, section1.xml, ... 등 여러 섹션을 가질 수 있다.
+// 아래 헬퍼는 모든 섹션을 찾아 정렬된 순서로 반환하고,
+// table_index를 글로벌하게 유니크하게 만들어주는 유틸리티.
+
+#[cfg(feature = "wasm")]
+fn find_section_xmls<'a>(
+    text_files: &'a std::collections::HashMap<String, String>,
+) -> Result<Vec<(&'a str, &'a str)>, JsError> {
+    let mut sections: Vec<(&str, &str)> = text_files
+        .iter()
+        .filter(|(name, _)| {
+            name.starts_with("Contents/section") && name.ends_with(".xml")
+        })
+        .map(|(name, content)| (name.as_str(), content.as_str()))
+        .collect();
+    sections.sort_by_key(|(name, _)| *name);
+    if sections.is_empty() {
+        return Err(JsError::new("HWPX에 섹션 파일이 없습니다 (Contents/sectionN.xml)"));
+    }
+    Ok(sections)
+}
+
+/// 섹션별 테이블 수를 파악해서 글로벌 table_index → (섹션 이름, 로컬 index) 매핑
+#[cfg(feature = "wasm")]
+struct SectionTableMap {
+    entries: Vec<(String, usize)>, // (section_name, table_count)
+}
+
+#[cfg(feature = "wasm")]
+impl SectionTableMap {
+    fn build(
+        text_files: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, JsError> {
+        let sections = find_section_xmls(text_files)?;
+        let mut entries = Vec::new();
+        for (name, xml) in &sections {
+            let tables = crate::stream_analyzer::analyze_xml(xml);
+            entries.push((name.to_string(), tables.len()));
+        }
+        Ok(Self { entries })
+    }
+
+    /// 글로벌 table_index를 (섹션 이름, 로컬 table_index)로 변환
+    fn resolve(&self, global_idx: usize) -> Option<(&str, usize)> {
+        let mut offset = 0;
+        for (name, count) in &self.entries {
+            if global_idx < offset + count {
+                return Some((name.as_str(), global_idx - offset));
+            }
+            offset += count;
+        }
+        None
+    }
+}
+
 /// HWPX 양식 분석 — 업로드된 바이트에서 테이블 구조 + 필드 매핑 추출
+/// 다중 섹션 지원: 모든 sectionN.xml을 순회하며 table_index를 글로벌하게 부여
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "analyzeForm")]
 pub fn analyze_form(hwpx_bytes: &[u8]) -> Result<AnalysisResult, JsError> {
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
-    let tables = crate::stream_analyzer::analyze_xml(section0);
-    let fields = crate::stream_analyzer::extract_fields(&tables);
-    let json = serde_json::to_string(&fields)
+    let sections = find_section_xmls(&text_files)?;
+    let mut all_fields = Vec::new();
+    let mut table_offset = 0;
+    for (_, xml) in &sections {
+        let tables = crate::stream_analyzer::analyze_xml(xml);
+        let mut fields = crate::stream_analyzer::extract_fields(&tables);
+        for f in &mut fields {
+            f.table_index += table_offset;
+        }
+        table_offset += tables.len();
+        all_fields.extend(fields);
+    }
+    let json = serde_json::to_string(&all_fields)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(AnalysisResult { json })
 }
 
 /// HWPX 양식 분석 — adaptive table recognition trace 포함
+/// 다중 섹션 지원: 모든 sectionN.xml 순회, 글로벌 table_index
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "analyzeFormAdaptive")]
 pub fn analyze_form_adaptive_wasm(
@@ -258,15 +363,31 @@ pub fn analyze_form_adaptive_wasm(
     let policy = parse_policy_json(policy_json)?;
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
-    let result = crate::stream_analyzer::analyze_form_adaptive(section0, Some(&policy));
-    let json = serde_json::to_string(&result)
+    let sections = find_section_xmls(&text_files)?;
+    let mut merged = crate::stream_analyzer::AdaptiveFieldAnalysis {
+        tables: Vec::new(),
+        fields: Vec::new(),
+        trace: Vec::new(),
+    };
+    let mut table_offset = 0;
+    for (_, xml) in &sections {
+        let mut result = crate::stream_analyzer::analyze_form_adaptive(xml, Some(&policy));
+        let section_table_count = result.tables.len();
+        for t in &mut result.tables { t.index += table_offset; }
+        for f in &mut result.fields { f.table_index += table_offset; }
+        for tr in &mut result.trace { tr.table_index += table_offset; }
+        merged.tables.extend(result.tables);
+        merged.fields.extend(result.fields);
+        merged.trace.extend(result.trace);
+        table_offset += section_table_count;
+    }
+    let json = serde_json::to_string(&merged)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(AnalysisResult { json })
 }
 
 /// HWPX 테이블 inspection — adaptive trace + raw grid
+/// 다중 섹션 지원
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "inspectTables")]
 pub fn inspect_tables_wasm(
@@ -276,15 +397,28 @@ pub fn inspect_tables_wasm(
     let policy = parse_policy_json(policy_json)?;
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
-    let result = crate::stream_analyzer::inspect_tables_adaptive(section0, Some(&policy));
-    let json = serde_json::to_string(&result)
+    let sections = find_section_xmls(&text_files)?;
+    let mut merged = crate::stream_analyzer::InspectTablesResult {
+        tables: Vec::new(),
+        trace: Vec::new(),
+    };
+    let mut table_offset = 0;
+    for (_, xml) in &sections {
+        let mut result = crate::stream_analyzer::inspect_tables_adaptive(xml, Some(&policy));
+        let section_table_count = result.tables.len();
+        for t in &mut result.tables { t.index += table_offset; }
+        for tr in &mut result.trace { tr.table_index += table_offset; }
+        merged.tables.extend(result.tables);
+        merged.trace.extend(result.trace);
+        table_offset += section_table_count;
+    }
+    let json = serde_json::to_string(&merged)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(AnalysisResult { json })
 }
 
 /// HWPX 양식 채움 — 원본 바이트 + 패치 목록 → 채워진 HWPX 바이트
+/// 다중 섹션 지원: 글로벌 tableIndex를 섹션별 로컬 인덱스로 변환
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "fillForm")]
 pub fn fill_form(hwpx_bytes: &[u8], patches_json: &str) -> Result<Vec<u8>, JsError> {
@@ -292,23 +426,44 @@ pub fn fill_form(hwpx_bytes: &[u8], patches_json: &str) -> Result<Vec<u8>, JsErr
         .map_err(|e| JsError::new(&format!("JSON parse error: {}", e)))?;
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+    let section_map = SectionTableMap::build(&text_files)?;
+
+    // 패치를 글로벌 index로 파싱
     let patch_list: Vec<(usize, u32, u32, String)> = patches.iter().map(|p| (
         p["tableIndex"].as_u64().unwrap_or(0) as usize,
         p["row"].as_u64().unwrap_or(0) as u32,
         p["col"].as_u64().unwrap_or(0) as u32,
         p["value"].as_str().unwrap_or("").to_string(),
     )).collect();
-    let patched_xml = crate::filler::fill(section0, &patch_list)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+
+    // 섹션별로 패치 그룹핑 (로컬 index로 변환)
+    let mut section_patches: std::collections::HashMap<String, Vec<(usize, u32, u32, String)>> =
+        std::collections::HashMap::new();
+    for (global_idx, row, col, value) in &patch_list {
+        if let Some((section_name, local_idx)) = section_map.resolve(*global_idx) {
+            section_patches
+                .entry(section_name.to_string())
+                .or_default()
+                .push((local_idx, *row, *col, value.clone()));
+        }
+    }
+
+    // 각 섹션을 독립적으로 패치
     let mut modified = std::collections::HashMap::new();
-    modified.insert("Contents/section0.xml".to_string(), patched_xml);
+    for (section_name, patches) in &section_patches {
+        let xml = text_files.get(section_name)
+            .ok_or_else(|| JsError::new(&format!("{} not found", section_name)))?;
+        let patched_xml = crate::filler::fill(xml, patches)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        modified.insert(section_name.clone(), patched_xml);
+    }
+
     crate::zipper::patch_hwpx(hwpx_bytes, &modified)
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
 /// HWPX 행 클론 — 특정 테이블의 행을 N번 복제
+/// 다중 섹션 지원: 글로벌 tableIndex를 섹션별로 분배
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "cloneRows")]
 pub fn clone_rows(hwpx_bytes: &[u8], clones_json: &str) -> Result<Vec<u8>, JsError> {
@@ -316,48 +471,77 @@ pub fn clone_rows(hwpx_bytes: &[u8], clones_json: &str) -> Result<Vec<u8>, JsErr
         .map_err(|e| JsError::new(&format!("JSON parse error: {}", e)))?;
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
+    let section_map = SectionTableMap::build(&text_files)?;
+
     let clone_list: Vec<(usize, u32, usize)> = clones.iter().map(|c| (
         c["tableIndex"].as_u64().unwrap_or(0) as usize,
         c["templateRowAddr"].as_u64().unwrap_or(0) as u32,
         c["count"].as_u64().unwrap_or(0) as usize,
     )).collect();
-    let patched_xml = crate::patcher::patch_clone_rows_multi(section0, &clone_list)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+
+    // 섹션별로 클론 요청 그룹핑
+    let mut section_clones: std::collections::HashMap<String, Vec<(usize, u32, usize)>> =
+        std::collections::HashMap::new();
+    for (global_idx, row_addr, count) in &clone_list {
+        if let Some((section_name, local_idx)) = section_map.resolve(*global_idx) {
+            section_clones
+                .entry(section_name.to_string())
+                .or_default()
+                .push((local_idx, *row_addr, *count));
+        }
+    }
+
     let mut modified = std::collections::HashMap::new();
-    modified.insert("Contents/section0.xml".to_string(), patched_xml);
+    for (section_name, clones) in &section_clones {
+        let xml = text_files.get(section_name)
+            .ok_or_else(|| JsError::new(&format!("{} not found", section_name)))?;
+        let patched_xml = crate::patcher::patch_clone_rows_multi(xml, clones)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        modified.insert(section_name.clone(), patched_xml);
+    }
+
     crate::zipper::patch_hwpx(hwpx_bytes, &modified)
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
 /// HWPX 테이블 구조를 LLM-friendly 텍스트로 포맷
+/// 다중 섹션 지원: 모든 섹션의 테이블을 합쳐서 포맷
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "formatForLLM")]
 pub fn format_for_llm_wasm(hwpx_bytes: &[u8]) -> Result<String, JsError> {
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
-    let tables = crate::stream_analyzer::analyze_xml(section0);
-    Ok(crate::llm_format::format_tables_for_llm(&tables))
+    let sections = find_section_xmls(&text_files)?;
+    let mut all_tables = Vec::new();
+    let mut table_offset = 0;
+    for (_, xml) in &sections {
+        let mut tables = crate::stream_analyzer::analyze_xml(xml);
+        for t in &mut tables { t.index += table_offset; }
+        table_offset += tables.len();
+        all_tables.extend(tables);
+    }
+    Ok(crate::llm_format::format_tables_for_llm(&all_tables))
 }
 
 /// HWPX 데이터 추출 — 채워진 양식에서 label:value 쌍 추출
+/// 다중 섹션 지원
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "extractData")]
 pub fn extract_data_wasm(hwpx_bytes: &[u8]) -> Result<AnalysisResult, JsError> {
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
-    let fields = crate::extractor::extract_data(section0);
-    let json = serde_json::to_string(&fields)
+    let sections = find_section_xmls(&text_files)?;
+    let mut all_fields = Vec::new();
+    for (_, xml) in &sections {
+        all_fields.extend(crate::extractor::extract_data(xml));
+    }
+    let json = serde_json::to_string(&all_fields)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(AnalysisResult { json })
 }
 
 /// HWPX 데이터 추출 — adaptive table recognition trace 포함
+/// 다중 섹션 지원
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = "extractDataAdaptive")]
 pub fn extract_data_adaptive_wasm(
@@ -367,10 +551,25 @@ pub fn extract_data_adaptive_wasm(
     let policy = parse_policy_json(policy_json)?;
     let text_files = crate::zipper::extract_text_files(hwpx_bytes)
         .map_err(|e| JsError::new(&e.to_string()))?;
-    let section0 = text_files.get("Contents/section0.xml")
-        .ok_or_else(|| JsError::new("section0.xml not found"))?;
-    let result = crate::extractor::extract_data_adaptive(section0, Some(&policy));
-    let json = serde_json::to_string(&result)
+    let sections = find_section_xmls(&text_files)?;
+    let mut merged = crate::extractor::AdaptiveExtractAnalysis {
+        tables: Vec::new(),
+        fields: Vec::new(),
+        trace: Vec::new(),
+    };
+    let mut table_offset = 0;
+    for (_, xml) in &sections {
+        let mut result = crate::extractor::extract_data_adaptive(xml, Some(&policy));
+        let section_table_count = result.tables.len();
+        for t in &mut result.tables { t.index += table_offset; }
+        for f in &mut result.fields { f.table_index += table_offset; }
+        for tr in &mut result.trace { tr.table_index += table_offset; }
+        merged.tables.extend(result.tables);
+        merged.fields.extend(result.fields);
+        merged.trace.extend(result.trace);
+        table_offset += section_table_count;
+    }
+    let json = serde_json::to_string(&merged)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(AnalysisResult { json })
 }
@@ -402,6 +601,62 @@ pub fn map_to_form_wasm(
     let json = serde_json::to_string(&result)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(AnalysisResult { json })
+}
+
+/// HWPX 테이블을 HTML <table>로 렌더링 — 채움 결과 미리보기용
+/// 다중 섹션 지원: 모든 섹션의 테이블을 순서대로 렌더링
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = "renderToHtml")]
+pub fn render_to_html(hwpx_bytes: &[u8]) -> Result<String, JsError> {
+    let text_files = crate::zipper::extract_text_files(hwpx_bytes)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let sections = find_section_xmls(&text_files)?;
+
+    let mut html = String::new();
+    let mut table_offset = 0;
+    for (section_name, xml) in &sections {
+        let tables = crate::stream_analyzer::analyze_xml(xml);
+        if sections.len() > 1 {
+            html.push_str(&format!(
+                "<h4 style=\"margin:16px 0 8px;color:#64748b;font-size:12px\">{}</h4>",
+                section_name.replace("Contents/", "")
+            ));
+        }
+        for table in &tables {
+            html.push_str(&format!(
+                "<table class=\"preview-table\" data-table-index=\"{}\" style=\"width:100%;border-collapse:collapse;font-size:13px;margin:8px 0 16px\">",
+                table.index + table_offset
+            ));
+            for row in &table.rows {
+                html.push_str("<tr>");
+                for cell in &row.cells {
+                    let is_label = cell.is_label;
+                    let bg = if is_label { "#f1f5f9" } else { "#fff" };
+                    let fw = if is_label { "600" } else { "400" };
+                    let cs = if cell.col_span > 1 { format!(" colspan=\"{}\"", cell.col_span) } else { String::new() };
+                    let rs = if cell.row_span > 1 { format!(" rowspan=\"{}\"", cell.row_span) } else { String::new() };
+                    let text = if cell.text.is_empty() { "&nbsp;" } else { &cell.text };
+                    html.push_str(&format!(
+                        "<td{}{} style=\"padding:6px 8px;border:1px solid #e2e8f0;background:{};font-weight:{}\">{}</td>",
+                        cs, rs, bg, fw, html_escape(text)
+                    ));
+                }
+                html.push_str("</tr>");
+            }
+            html.push_str("</table>");
+        }
+        table_offset += tables.len();
+    }
+    Ok(html)
+}
+
+#[cfg(feature = "wasm")]
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+     .replace('\n', "<br>")
 }
 
 /// 구조 피드백으로 adaptive policy 갱신
